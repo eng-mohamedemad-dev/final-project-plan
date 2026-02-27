@@ -13,6 +13,7 @@ Build a multi-guard crime prediction system where AI models monitor Tapo C200 ca
   - If camera has NO storage → `storage_type = 'none'` → Laravel runs a **continuous ffmpeg recording service** that records RTSP segments (1 minute each) to the server. When a crime is reported, Laravel finds the relevant segments by timestamp, merges them into a single evidence file in `storage/app/crimes/`, and cleans up old segments.
 - `sence_path` = file path to the recorded video evidence (either fetched from camera or assembled from ffmpeg segments).
 - **RTSP URL**: The full RTSP URL (e.g. `rtsp://user:pass@192.168.1.6:554/stream2`) is returned as a complete field when serving cameras to the model, so the model connects directly without constructing URLs.
+- **Remote cameras (different networks)**: Cameras deployed on the street (different WiFi networks) need port forwarding on their router to be accessible. The camera model stores both `ip_address` (for display) and `connection_ip` + `connection_port` (for actual RTSP/API access). The `rtsp_url` accessor uses `connection_ip:connection_port`. For cameras on the same LAN, `connection_ip` = `ip_address` and `connection_port` = `554`. For remote cameras, `connection_ip` = public IP of the router + port forwarded to camera RTSP port.
 - Officers see crimes within 5km of their GPS location.
 - Firebase tokens are polymorphic for push notifications to all 3 user types.
 - Camera `stream_path` stores RTSP stream URLs (stream1 = high quality for recording, stream2 = low quality for AI processing).
@@ -85,7 +86,7 @@ Build a multi-guard crime prediction system where AI models monitor Tapo C200 ca
 
 3. Create the `officers` migration and model at `app/Models/Officer.php` with fields: `id`, `police_station_id` (FK), `name`, `email`, `phone`, `password`, `latitude` (decimal 10,7), `longitude` (decimal 10,7), `last_location_update` (timestamp, nullable), `status` (enum: `available`, `busy`, `offline`, default `offline`), `is_on_shift` (boolean, default false), timestamps. Use `Authenticatable`. Relationships: `belongsTo(PoliceStation)`, `hasMany(Crime)`, `morphMany(FirebaseToken)`, `morphMany(Notification)`.
 
-4. Create the `cameras` migration and model at `app/Models/Camera.php` with all ERD fields: `id`, `name`, `police_station_id` (FK), `ip_address`, `user_name`, `password`, `tapo_email`, `tapo_password`, `stream_path` (JSON for stream1/stream2), `location_name`, `lat` (decimal 10,7), `lang` (decimal 10,7), `model_ip_address` (nullable), `is_active` (boolean, default false), `storage_type` (enum: `sd_card`, `cloud`, `none`, default `none` — determines recording strategy), timestamps. Relationships: `belongsTo(PoliceStation)`, `hasMany(Crime)`. Add unique constraint on `ip_address`. Add accessor `rtsp_url` that builds the full RTSP URL: `rtsp://{user_name}:{password}@{ip_address}:554/stream2`.
+4. Create the `cameras` migration and model at `app/Models/Camera.php` with all ERD fields: `id`, `name`, `police_station_id` (FK), `ip_address`, `user_name`, `password`, `tapo_email`, `tapo_password`, `stream_path` (JSON for stream1/stream2), `location_name`, `lat` (decimal 10,7), `lang` (decimal 10,7), `model_ip_address` (nullable), `is_active` (boolean, default false), `storage_type` (enum: `sd_card`, `cloud`, `none`, default `none` — determines recording strategy), `connection_ip` (nullable — public/VPN IP for remote cameras; if null, falls back to `ip_address`), `connection_port` (integer, default 554 — RTSP port, can be a forwarded port for remote cameras), `api_port` (integer, default 443 — Tapo HTTPS API port, can be forwarded), `onvif_port` (integer, default 2020 — ONVIF port, can be forwarded), timestamps. Relationships: `belongsTo(PoliceStation)`, `hasMany(Crime)`. Add unique constraint on `ip_address`. Add accessor `rtsp_url` that builds the full RTSP URL using `connection_ip` (or `ip_address` as fallback) and `connection_port`: `rtsp://{user_name}:{password}@{effective_ip}:{connection_port}/stream2`. Add accessor `effective_ip` that returns `connection_ip ?? ip_address`. Add accessor `effective_api_url` that returns `https://{effective_ip}:{api_port}`.
 
 5. Create the `crime_types` migration and model at `app/Models/CrimeType.php` with fields: `id`, `name_en`, `name_ar`, `description`, `default_severity` (enum: low/medium/high/critical), timestamps. Seed with common crime types (theft, assault, vandalism, break-in, suspicious_activity, etc.).
 
@@ -868,7 +869,8 @@ Cast them in models via `casts()` method.
 - **Model Auth**: Simple API key middleware (not Sanctum) since the AI model is a service, not a user
 - **Scene Recording**: Dual strategy — camera with storage uses its own API, camera without storage uses server-side ffmpeg recording (1-min segments, merged on demand)
 - **Camera Alarm**: Triggered **directly by the AI model** (not through Laravel) for fastest response time. Model already has camera credentials from the claim API.
-- **RTSP URL**: Full URL returned in camera API response for direct model connection. Format: `rtsp://{user}:{pass}@{ip}:554/stream2`
+- **RTSP URL**: Full URL returned in camera API response for direct model connection. Format: `rtsp://{user}:{pass}@{effective_ip}:{connection_port}/stream2`. Uses `connection_ip` (public/VPN IP) if set, otherwise falls back to `ip_address` (local LAN).
+- **Camera Networking**: Cameras on remote networks (different WiFi) require port forwarding. The camera model stores `connection_ip`, `connection_port`, `api_port`, `onvif_port` — these can differ from local LAN values. For same-network cameras, these fields are either null (use defaults) or match local values. For remote cameras, `connection_ip` = router public IP, ports = forwarded ports. This keeps the system flexible for both dev (same LAN) and production (remote) without code changes.
 - **Model Load Balancing**: Each model instance handles max 10 cameras, enforced by API. Load distributed automatically via claim mechanism.
 - **Enums**: PHP 8.4 backed enums for all status/type fields — type-safe, auto-cast in models
 - **Caching**: Redis for settings, session, queue, and cache. All configurable values cached.
@@ -983,6 +985,55 @@ database/
 ├── factories/                   Factory for each model
 └── seeders/                     Seeder for each model + DatabaseSeeder
 ```
+
+---
+
+## API Versioning & Route Organization
+
+All API routes are organized into separate files under `routes/api/` for maintainability and versioning:
+
+```
+routes/
+├── api.php                         ← Central importer (no inline routes)
+├── web.php                         ← Livewire admin dashboard
+└── api/
+    ├── camera.php                  ← Camera hardware control (unversioned)
+    └── v1/
+        ├── shared.php              ← Auth, profile, notifications — /{guard}/...
+        ├── admin.php               ← Admin-specific routes
+        ├── police-station.php      ← Police station-specific routes
+        ├── officer.php             ← Officer-specific routes
+        └── model.php               ← AI model integration routes
+```
+
+### Versioning Strategy
+
+- **Versioned routes** (`/api/v1/...`): All client-facing endpoints (mobile apps, admin dashboard). When breaking changes are needed, create a `v2/` folder and add new route files without touching `v1/`.
+- **Unversioned routes** (`/api/camera/...`, `/api/model/...`): Internal service routes for camera hardware control and AI model communication. These are consumed only by internal systems and don't need versioning.
+
+### How `api.php` Works
+
+```php
+// Camera control API (unversioned — internal hardware control)
+require __DIR__.'/api/camera.php';
+
+// Versioned API routes (v1)
+Route::prefix('v1')->group(function () {
+    require __DIR__.'/api/v1/shared.php';
+    require __DIR__.'/api/v1/admin.php';
+    Route::prefix('police-station')->group(fn () => require __DIR__.'/api/v1/police-station.php');
+    Route::prefix('officer')->group(fn () => require __DIR__.'/api/v1/officer.php');
+});
+
+// AI Model routes (unversioned — internal service)
+Route::prefix('model')->group(fn () => require __DIR__.'/api/v1/model.php');
+```
+
+### Adding a New Version
+
+1. Create `routes/api/v2/` with only the changed route files.
+2. Add `Route::prefix('v2')->group(...)` in `api.php`.
+3. Old mobile apps continue hitting `/api/v1/`, new versions use `/api/v2/`.
 
 ---
 
