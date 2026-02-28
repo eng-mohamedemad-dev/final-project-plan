@@ -8,7 +8,7 @@ Build a multi-guard crime prediction system where AI models monitor Tapo C200 ca
 - The AI model is registered by the **admin** from the dashboard. Admin creates a model instance (email, password, IP whitelist) and assigns specific cameras to it via checkboxes (only unassigned cameras are shown). The model then logs in via its own endpoint and receives a Sanctum token.
 - **IP Verification**: Every model API request (including login) is validated against the model's whitelisted `ip_address`. If the request IP doesn't match, it's rejected with 403. This prevents stolen credentials from being used elsewhere.
 - **Camera assignment**: Cameras are assigned to models by the admin (many-to-many via `camera_model` pivot table). The model simply fetches its assigned cameras — no claim/release mechanism needed.
-- **Camera data encryption**: Sensitive camera data (credentials, RTSP URLs) returned to the model API is **encrypted** using AES-256-CBC with a shared secret (`MODEL_ENCRYPTION_KEY` in `.env`). The model decrypts it on its side using the same key. This prevents credential theft if API responses are intercepted.
+- **Camera data encryption**: Sensitive camera data (credentials, RTSP URLs) returned to the model API is **encrypted** using AES-256-CBC with a **per-user encryption key** (stored in the user's DB record — `ai_models.encryption_key`, `police_stations.encryption_key`, `officers.encryption_key`). The key is a 64-character random string, regenerated on each login and returned with the Sanctum token. The model/app decrypts it locally using this key. This prevents credential theft if API responses are intercepted.
 - **Camera alarm**: The AI model triggers the camera alarm **directly** (since it already has RTSP access to the camera). This is faster than routing through Laravel. The model calls the camera's alarm API immediately upon detection.
 - **Scene recording — dual strategy**:
   - If camera has storage (SD card or cloud) → `storage_type = 'sd_card'` or `'cloud'` → Laravel fetches the recording from the camera using the existing recording API endpoints.
@@ -86,21 +86,21 @@ Build a multi-guard crime prediction system where AI models monitor Tapo C200 ca
 
 ## Phase 1: Database Schema & Models
 
-1. Create the `admins` migration and model at `app/Models/Admin.php` with fields: `id`, `name`, `email`, `phone`, `password`, `avatar` (nullable — profile photo path), timestamps. Use `Authenticatable` base class. Add `HasFactory`, `Notifiable`, `HasApiTokens` traits.
+1. Create the `admins` migration and model at `app/Models/Admin.php` with fields: `id`, `name`, `email`, `phone`, `password`, `avatar` (nullable — profile photo path), timestamps. Use `Authenticatable` base class. Add `HasFactory`, `Notifiable` traits. Admin does NOT use API tokens (Livewire session auth only).
 
-2. Create the `police_stations` migration and model at `app/Models/PoliceStation.php` with fields: `id`, `name`, `email`, `phone`, `password`, `avatar` (nullable — station logo/photo), `address` (nullable), `city` (nullable), `governorate` (nullable), timestamps. Use `Authenticatable`. Relationships: `hasMany(Officer)`, `hasMany(Camera)`, `hasMany(Crime)` (through cameras), `morphMany(FirebaseToken)`, `morphMany(Notification)`.
+2. Create the `police_stations` migration and model at `app/Models/PoliceStation.php` with fields: `id`, `name`, `email`, `phone`, `password`, `avatar` (nullable — station logo/photo), `address` (nullable), `city` (nullable), `governorate` (nullable), `encryption_key` (nullable — 64-char random string, regenerated on each login, used for AES-256-CBC encryption of sensitive data), timestamps. Use `Authenticatable`. Relationships: `hasMany(Officer)`, `hasMany(Camera)`, `hasMany(Crime)` (through cameras), `morphMany(FirebaseToken)`, `morphMany(Notification)`.
 
-3. Create the `officers` migration and model at `app/Models/Officer.php` with fields: `id`, `police_station_id` (FK), `name`, `email`, `phone`, `password`, `avatar` (nullable — officer photo), `national_id` (nullable, unique — الرقم القومي), `rank` (nullable — e.g. ملازم, نقيب, رائد), `badge_number` (nullable, unique), `latitude` (decimal 10,7), `longitude` (decimal 10,7), `last_location_update` (timestamp, nullable), `status` (enum: `available`, `busy`, `offline`, default `offline`), `is_on_shift` (boolean, default false), timestamps. Use `Authenticatable`. Relationships: `belongsTo(PoliceStation)`, `hasMany(Crime)`, `morphMany(FirebaseToken)`, `morphMany(Notification)`.
+3. Create the `officers` migration and model at `app/Models/Officer.php` with fields: `id`, `police_station_id` (FK), `name`, `email`, `phone`, `password`, `avatar` (nullable — officer photo), `national_id` (nullable, unique — الرقم القومي), `rank` (nullable — e.g. ملازم, نقيب, رائد), `badge_number` (nullable, unique), `latitude` (decimal 10,7), `longitude` (decimal 10,7), `last_location_update` (timestamp, nullable), `status` (enum: `available`, `busy`, `offline`, default `offline`), `is_on_shift` (boolean, default false), `encryption_key` (nullable — 64-char random string, regenerated on each login, used for AES-256-CBC encryption of sensitive data), timestamps. Use `Authenticatable`. Relationships: `belongsTo(PoliceStation)`, `hasMany(Crime)`, `morphMany(FirebaseToken)`, `morphMany(Notification)`.
 
 4. Create the `cameras` migration and model at `app/Models/Camera.php` with all ERD fields: `id`, `name`, `police_station_id` (FK), `ip_address`, `user_name`, `password`, `tapo_email`, `tapo_password`, `stream_path` (JSON for stream1/stream2), `location_name`, `lat` (decimal 10,7), `lang` (decimal 10,7), `is_active` (boolean, default false), `storage_type` (enum: `sd_card`, `cloud`, `none`, default `none` — determines recording strategy), `connection_ip` (nullable — public/VPN IP for remote cameras; if null, falls back to `ip_address`), `connection_port` (integer, default 554 — RTSP port, can be a forwarded port for remote cameras), `api_port` (integer, default 443 — Tapo HTTPS API port, can be forwarded), `onvif_port` (integer, default 2020 — ONVIF port, can be forwarded), timestamps. Relationships: `belongsTo(PoliceStation)`, `hasMany(Crime)`, `belongsToMany(AiModel)`. Add unique constraint on `ip_address`. Add accessor `rtsp_url` that builds the full RTSP URL using `connection_ip` (or `ip_address` as fallback) and `connection_port`: `rtsp://{user_name}:{password}@{effective_ip}:{connection_port}/stream2`. Add accessor `effective_ip` that returns `connection_ip ?? ip_address`. Add accessor `effective_api_url` that returns `https://{effective_ip}:{api_port}`.
 
-4b. Create the `ai_models` migration and model at `app/Models/AiModel.php` with fields: `id`, `name` (descriptive label), `email` (unique — for login), `password`, `ip_address` (whitelisted IP — used to verify every request), `is_active` (boolean, default true), `last_heartbeat_at` (timestamp, nullable), timestamps. Use `Authenticatable` base class. Add `HasFactory`, `HasApiTokens` traits. Relationships: `belongsToMany(Camera)`.
+4b. Create the `ai_models` migration and model at `app/Models/AiModel.php` with fields: `id`, `name` (descriptive label), `email` (unique — for login), `password`, `ip_address` (whitelisted IP — used to verify every request), `is_active` (boolean, default true), `last_heartbeat_at` (timestamp, nullable), `encryption_key` (nullable — 64-char random string, regenerated on each login, used for AES-256-CBC encryption of camera data), timestamps. Use `Authenticatable` base class. Add `HasFactory`, `HasApiTokens` traits. Relationships: `belongsToMany(Camera)`.
 
 4c. Create the `camera_ai_model` pivot migration (pivot table): `camera_id` (FK), `ai_model_id` (FK), timestamps. Composite unique constraint on `[camera_id, ai_model_id]`.
 
 5. Create the `crime_types` migration and model at `app/Models/CrimeType.php` with fields: `id`, `name_en`, `name_ar`, `description`, `default_severity` (enum: low/medium/high/critical), timestamps. Seed with common crime types (theft, assault, vandalism, break-in, suspicious_activity, etc.).
 
-6. Create the `scenses` migration and model at `app/Models/Scene.php` with fields: `id`, `start_date`, `end_date`, `crime_id` (FK, nullable initially), `sence_path`, `thumbnail_path` (nullable — extracted frame for quick preview), timestamps. Relationship: `belongsTo(Crime)`.
+6. Create the `scenses` migration and model at `app/Models/Scene.php` with fields: `id`, `start_date`, `end_date`, `crime_id` (FK, nullable initially), `sence_path`, timestamps. Relationship: `belongsTo(Crime)`.
 
 7. Create the `crimes` migration and model at `app/Models/Crime.php` with fields: `id`, `officer_id` (FK, nullable), `camera_id` (FK), `scene_id` (FK, nullable), `crime_type_id` (FK, nullable), `crime_date`, `status` (enum: pending/assigned/in_progress/visited/not_visited/resolved/escalated/false_alarm), `severity` (enum: low/medium/high/critical), `confidence_score` (decimal 5,2 — from AI model, 0-100%), `officer_arrive_time` (nullable), `no_visit_reason` (nullable text), `escalation_count` (integer, default 0), `response_time_minutes` (integer, nullable — auto-calculated), timestamps. Relationships: `belongsTo(Officer)`, `belongsTo(Camera)`, `belongsTo(CrimeType)`, `hasOne(Scene)`. Scopes: `pending()`, `active()`, `byRadius($lat, $lng, $km)`.
 
@@ -501,9 +501,12 @@ Cast them in models via `casts()` method.
 14. Configure Sanctum to support all 4 guards for API token authentication. Each guard uses Sanctum's `HasApiTokens` trait on the model.
 
 15. Create **shared** `AuthController` (single controller, dynamic guard via URL segment `/{guard}`):
-    - `POST /api/v1/{guard}/login` — resolves guard from URL, authenticates, returns Sanctum token
+    - `POST /api/v1/{guard}/login` — resolves guard from URL, authenticates, **regenerates** the user's `encryption_key` (64-char random string), saves to DB, returns Sanctum token + encryption key. Token has 7-day expiry.
     - `POST /api/v1/{guard}/logout` — logout, revoke token
     - All shared routes under `/{guard}` prefix: profile, notifications, firebase-token, dashboard
+
+15b. Create a **public settings endpoint** (no auth required):
+    - `GET /api/v1/settings/language` — returns the system language (`ar` or `en`) from the settings table. Flutter apps call this on startup to set the app language. Only the admin can change the system language from the dashboard.
 
 16. Create `ResolveGuardMiddleware` — maps URL segment to auth guard:
     - `admin` → `admin` guard + `Admin` model
@@ -599,8 +602,8 @@ Cast them in models via `casts()` method.
 ## Phase 6: AI Model Integration API
 
 26. Create `AiModelController` with endpoints for the AI model to interact with Laravel:
-    - `POST /api/model/login` — authenticate model with email + password. Also verifies request IP matches the whitelisted `ip_address` in the `ai_models` table. Returns Sanctum token.
-    - `GET /api/model/cameras` — returns **only cameras assigned to the authenticated model** (via `camera_ai_model` pivot table) with `is_active = true`. **Camera credentials are encrypted** using AES-256-CBC with `MODEL_ENCRYPTION_KEY` (shared between Laravel and model). Returns:
+    - `POST /api/model/login` — authenticate model with email + password. Also verifies request IP matches the whitelisted `ip_address` in the `ai_models` table. **Regenerates** the model's `encryption_key` (64-char random string), saves it to DB, and returns Sanctum token + encryption key.
+    - `GET /api/model/cameras` — returns **only cameras assigned to the authenticated model** (via `camera_ai_model` pivot table) with `is_active = true`. **Camera credentials are encrypted** using AES-256-CBC with the model's per-user `encryption_key` (stored in `ai_models` table, regenerated on each login). Returns:
       ```json
       {
         "cameras": [
@@ -657,10 +660,10 @@ Cast them in models via `casts()` method.
 27. Secure model endpoints with Sanctum token authentication (`auth:sanctum` guard `ai_model`) + `VerifyModelIpMiddleware` on every request. The login endpoint itself also verifies IP before issuing a token.
 
 28. Create `EncryptionService` at `app/Services/Encryption/EncryptionService.php`:
-    - Uses AES-256-CBC with `MODEL_ENCRYPTION_KEY` from `.env`
-    - Methods: `encrypt(array $data): string`, `decrypt(string $encrypted): array`
-    - Used by `ModelCameraResource` to encrypt camera credentials before API response
-    - The AI model service uses the same key to decrypt on its side
+    - Uses AES-256-CBC with the **authenticated user's `encryption_key`** from the database
+    - Methods: `encrypt(array $data, string $key): string`, `decrypt(string $encrypted, string $key): array`
+    - Used by `ModelCameraResource` and `CameraResource` to encrypt camera credentials before API response
+    - The AI model / Flutter apps decrypt using the key received at login
 
 29. Create a **scheduled task** (every 2 minutes) to check model heartbeats — mark models as inactive (`is_active = false`) if heartbeat missed, log the event.
 
@@ -803,7 +806,7 @@ Cast them in models via `casts()` method.
     - `recording_segment_duration_seconds` (default 60 — ffmpeg segment length for cameras with no storage)
     - `recording_retention_days` (default 7 — how long to keep ffmpeg segments)
     - `crime_evidence_retention_days` (default 90 — how long to keep crime evidence files)
-    - `model_encryption_key` — AES-256-CBC key shared between Laravel and AI model (also in `.env` as `MODEL_ENCRYPTION_KEY`)
+    - `model_encryption_key` — ~~REMOVED~~ Encryption is now **per-user** (stored in each user's DB record: `ai_models.encryption_key`, `police_stations.encryption_key`, `officers.encryption_key`). Regenerated on each login.
 
 44. Create `Setting` model and `SettingsService` for easy access: `Setting::get('key', 'default')`, `Setting::set('key', 'value')`. Cache settings in Redis for performance.
 
@@ -838,7 +841,7 @@ Cast them in models via `casts()` method.
 ## Phase 14: Real-time Chat System
 
 46. Create `chat_messages` migration and model at `app/Models/ChatMessage.php`:
-    - Fields: `id`, `conversation_key` (string, indexed — e.g. `admin_1_station_3` or `station_2_officer_5`), `sender_type` (polymorphic), `sender_id`, `receiver_type` (polymorphic), `receiver_id`, `message` (text), `type` (enum: text/image/file), `file_path` (nullable), `is_read` (boolean, default false), `read_at` (nullable), timestamps.
+    - Fields: `id`, `conversation_key` (string, indexed — e.g. `admin_1_station_3` or `station_2_officer_5`), `sender_type` (polymorphic), `sender_id`, `receiver_type` (polymorphic), `receiver_id`, `message` (text), `is_read` (boolean, default false), `read_at` (nullable), timestamps.
     - Relationships: `morphTo()` for sender and receiver
     - Scopes: `forConversation($key)`, `unread()`
 
@@ -859,7 +862,7 @@ Cast them in models via `casts()` method.
     - Unread badge count on chat icon
 
 50. Chat features:
-    - Text messages + image/file attachments
+    - Text messages only (no file/image attachments)
     - Read receipts (is_read + read_at)
     - Unread count per conversation
     - Message history with pagination (cursor-based for performance)
@@ -881,11 +884,12 @@ Cast them in models via `casts()` method.
     - Send push notification in the user's preferred language (stored in profile)
     - System language setting as default, per-user override
 
-53. **Camera Live View Proxy** (for admin dashboard & police station app):
+53. **Camera Live View** (for police station Flutter app):
     - Endpoint: `GET /api/v1/police-station/cameras/{id}/live`
-    - Proxy RTSP stream as HLS/DASH for browser/mobile playback
-    - Use ffmpeg to transcode RTSP → HLS on-demand
+    - Returns the camera's RTSP stream URL (encrypted using the user's `encryption_key`)
+    - Flutter app uses `flutter_vlc_player` or `media_kit` package to play RTSP streams directly
     - Security: only authenticated users of the owning police station can view
+    - No server-side transcoding needed — Flutter plays RTSP natively via VLC
 
 54. **Officer Shift Management**:
     - Police station can set shift schedules for officers
@@ -926,7 +930,7 @@ Cast them in models via `casts()` method.
 - **Crime Assignment**: Automatic — system finds nearest officer and assigns. Officer can decline with reason. Auto-escalation after timeout.
 - **Model Auth**: Sanctum token + IP whitelist verification. Model logs in with email/password (like other guards), gets a Sanctum token. Every request also verified against whitelisted IP via `VerifyModelIpMiddleware`. Login itself checks IP before issuing token.
 - **Model Management**: Admin registers AI model instances from the dashboard (name, email, password, IP). Admin assigns cameras to models via checkboxes (many-to-many pivot). Only cameras NOT assigned to another model are shown. No self-service claiming.
-- **Camera Data Encryption**: Sensitive camera data (credentials, RTSP URLs, IPs) encrypted with AES-256-CBC using `MODEL_ENCRYPTION_KEY` before sending to model API. Model decrypts using the same shared key. Prevents data interception.
+- **Camera Data Encryption**: Sensitive camera data (credentials, RTSP URLs, IPs) encrypted with AES-256-CBC using a **per-user encryption key** (stored in the user's DB table — `ai_models`, `police_stations`, `officers`). The key is a 64-character random string, regenerated on each login and returned with the Sanctum token. Flutter apps and AI model use this key to decrypt camera data locally. Prevents data interception even if API responses are captured.
 - **Password Management**: Hierarchical password resets — admin can reset police station and model passwords; police station can reset officer passwords. No self-service password reset (no email flow).
 - **Scene Recording**: Dual strategy — camera with storage uses its own API, camera without storage uses server-side ffmpeg recording (1-min segments, merged on demand)
 - **Camera Alarm**: Triggered **directly by the AI model** (not through Laravel) for fastest response time. Model already has camera credentials from the assigned cameras API (decrypted locally).
@@ -981,7 +985,7 @@ app/
 ├── Models/              Admin, PoliceStation, Officer, Camera, Crime, Scene,
 │                        CrimeType, FirebaseToken, Setting, ActivityLog, ChatMessage, AiModel
 │
-├── Enums/               CrimeStatus, CrimeSeverity, OfficerStatus, StorageType, DeviceType, MessageType
+├── Enums/               CrimeStatus, CrimeSeverity, OfficerStatus, StorageType, DeviceType
 │
 ├── Http/
 │   ├── Controllers/
@@ -1126,7 +1130,7 @@ Route::prefix('model')->group(fn () => require __DIR__.'/api/v1/model.php');
 ### Shared Routes (all guards via `/{guard}` prefix)
 | Method | Endpoint | Description |
 |---|---|---|
-| POST | `/api/v1/{guard}/login` | Login, returns Sanctum token |
+| POST | `/api/v1/{guard}/login` | Login, returns Sanctum token + encryption key |
 | POST | `/api/v1/{guard}/logout` | Logout, revoke token |
 | GET | `/api/v1/{guard}/profile` | Get profile |
 | PUT | `/api/v1/{guard}/profile` | Update profile |
@@ -1137,6 +1141,11 @@ Route::prefix('model')->group(fn () => require __DIR__.'/api/v1/model.php');
 | DELETE | `/api/v1/{guard}/firebase-token` | Remove FCM token |
 | GET | `/api/v1/{guard}/dashboard` | Dashboard stats (guard-aware) |
 | GET | `/api/v1/{guard}/statistics` | Statistics by period |
+
+### Public API (no auth)
+| Method | Endpoint | Description |
+|---|---|---|
+| GET | `/api/v1/settings/language` | Get system language (ar/en) — used by Flutter on startup |
 
 ### Police Station App (guard-specific)
 | Method | Endpoint | Description |
@@ -1155,6 +1164,7 @@ Route::prefix('model')->group(fn () => require __DIR__.'/api/v1/model.php');
 | GET | `/api/v1/police-station/chat/{officer}` | Messages with officer |
 | POST | `/api/v1/police-station/chat/{officer}` | Send message to officer |
 | PUT | `/api/v1/police-station/officers/{id}/reset-password` | Reset officer password |
+| GET | `/api/v1/police-station/cameras/{id}/live` | Get live stream URL (RTSP/HLS) for viewing |
 
 ### Officer App (guard-specific)
 | Method | Endpoint | Description |
@@ -1190,7 +1200,7 @@ Route::prefix('model')->group(fn () => require __DIR__.'/api/v1/model.php');
 ### AI Model
 | Method | Endpoint | Description |
 |---|---|---|
-| POST | `/api/model/login` | Login (email + password + IP verification) |
+| POST | `/api/model/login` | Login (email + password + IP verification), returns token + encryption key |
 | GET | `/api/model/cameras` | List assigned cameras (encrypted credentials) |
 | POST | `/api/model/heartbeat` | Model heartbeat |
 | POST | `/api/model/alert` | Suspicious activity alert |

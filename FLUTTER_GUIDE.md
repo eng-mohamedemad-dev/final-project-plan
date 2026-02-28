@@ -75,11 +75,12 @@ This is a **Crime Prediction System** that uses AI cameras to detect crimes. The
 | `firebase_core` | Firebase initialization |
 | `google_maps_flutter` | Maps for crime locations + officer tracking |
 | `geolocator` | GPS location tracking |
-| `shared_preferences` or `flutter_secure_storage` | Store auth token |
+| `shared_preferences` or `flutter_secure_storage` | Store auth token + encryption key |
 | `provider` / `riverpod` / `bloc` | State management (your choice) |
-| `image_picker` | Chat image attachments |
 | `file_picker` | Excel file upload |
 | `video_player` | Play crime scene evidence videos |
+| `flutter_vlc_player` or `media_kit` | RTSP live stream playback (camera live view) |
+| `encrypt` / `pointycastle` | AES-256-CBC decryption of camera data |
 
 ---
 
@@ -123,6 +124,7 @@ POST /api/v1/{guard}/login
   "message": "Login successful",
   "data": {
     "token": "1|abc123def456...",
+    "encryption_key": "aB3cD4eF5gH6iJ7kL8mN9oP0qR1sT2uV3wX4yZ5aB6cD7eF8gH9iJ0kL1mN2oP3",
     "user": {
       "id": 1,
       "name": "Ahmed Mohamed",
@@ -134,7 +136,7 @@ POST /api/v1/{guard}/login
 }
 ```
 
-**Store the token** securely and include it in all subsequent requests.
+**Store the token AND encryption_key** securely using `flutter_secure_storage`. The encryption key is used to decrypt sensitive camera data (RTSP URLs, credentials) received from the API. The key is regenerated on every login, so always use the latest one.
 
 ### Logout
 
@@ -144,6 +146,75 @@ Authorization: Bearer {token}
 ```
 
 Revokes the token on the server side.
+
+### System Language (IMPORTANT)
+
+The app language is controlled by the admin from the dashboard. The Flutter app must fetch the system language on startup (before login) and use it for the entire UI.
+
+```
+GET /api/v1/settings/language
+```
+
+**Response:**
+```json
+{
+  "status": true,
+  "data": {
+    "language": "ar"
+  }
+}
+```
+
+**Important Notes:**
+- This endpoint requires **NO authentication** — it's public
+- Call this on every app startup to get the latest language
+- The user has NO option to change the language in the app — it's admin-controlled
+- Supported values: `ar` (Arabic, RTL) and `en` (English, LTR)
+- Cache the language locally for offline use, but refresh on every startup
+
+### Encryption — Decrypting Camera Data
+
+Some API responses contain encrypted sensitive data (camera credentials, RTSP URLs). The Flutter app must decrypt this data using the `encryption_key` received at login.
+
+**Algorithm:** AES-256-CBC
+
+**Encrypted data format:** Base64-encoded string containing `IV:CIPHERTEXT` (16-byte IV prepended to ciphertext, then Base64-encoded)
+
+**Decryption steps:**
+1. Base64-decode the `encrypted_data` field
+2. Extract the first 16 bytes as the IV
+3. Decrypt the remaining bytes using AES-256-CBC with the `encryption_key` and IV
+4. Parse the decrypted string as JSON
+
+**Dart example using `encrypt` package:**
+```dart
+import 'package:encrypt/encrypt.dart';
+import 'dart:convert';
+
+Map<String, dynamic> decryptCameraData(String encryptedData, String encryptionKey) {
+  final decoded = base64.decode(encryptedData);
+  final iv = IV(decoded.sublist(0, 16));
+  final cipherText = Encrypted(decoded.sublist(16));
+  final key = Key.fromUtf8(encryptionKey.substring(0, 32)); // AES-256 needs 32 bytes
+  final encrypter = Encrypter(AES(key, mode: AESMode.cbc));
+  final decrypted = encrypter.decrypt(cipherText, iv: iv);
+  return jsonDecode(decrypted);
+}
+```
+
+**When decrypted, camera data contains:**
+```json
+{
+  "ip_address": "192.168.1.6",
+  "connection_ip": "41.35.100.50",
+  "connection_port": 8554,
+  "rtsp_url": "rtsp://user:pass@41.35.100.50:8554/stream2",
+  "user_name": "admin",
+  "password": "camera123",
+  "api_port": 8443,
+  "onvif_port": 8080
+}
+```
 
 ### Error Response Format (All Endpoints)
 
@@ -309,14 +380,16 @@ GET /api/v1/officer/statistics?period=weekly
 | 7 | **Cameras List** | All cameras with status (active/inactive) |
 | 8 | **Camera Create/Edit** | Add/edit camera form |
 | 9 | **Cameras Import** | Upload Excel to bulk create cameras |
-| 10 | **Crimes List** | All crimes with filters (status, date, officer, camera) |
-| 11 | **Crime Detail** | Full crime info + evidence + assigned officer |
-| 12 | **Crime Manual Assignment** | Assign crime to specific officer |
-| 13 | **Chat Conversations** | List of chats with officers |
-| 14 | **Chat Thread** | Chat with specific officer |
-| 15 | **Profile** | View/edit station profile (name, email, phone, address, city, governorate, avatar) |
-| 16 | **Notifications** | List of all notifications |
-| 17 | **Statistics** | Crime stats by period |
+| 10 | **Camera Live View** | Live RTSP stream from camera using flutter_vlc_player/media_kit |
+| 11 | **Camera Control** | Full camera control panel (alarm, PTZ, settings, recordings) |
+| 12 | **Crimes List** | All crimes with filters (status, date, officer, camera) |
+| 13 | **Crime Detail** | Full crime info + evidence + assigned officer |
+| 14 | **Crime Manual Assignment** | Assign crime to specific officer |
+| 15 | **Chat Conversations** | List of chats with officers |
+| 16 | **Chat Thread** | Chat with specific officer |
+| 17 | **Profile** | View/edit station profile (name, email, phone, address, city, governorate, avatar) |
+| 18 | **Notifications** | List of all notifications |
+| 19 | **Statistics** | Crime stats by period |
 
 ### Screen Details
 
@@ -455,7 +528,83 @@ POST   /api/v1/police-station/cameras/import        → Excel import
 
 > **Note on connection fields:** If the camera is on the same local network as the server, you can leave `connection_ip` as null and `connection_port` as 554 (defaults). If the camera is on a remote network (e.g., deployed on a street with different WiFi), set `connection_ip` to the router's public IP and `connection_port` to the forwarded RTSP port.
 
-#### 5. Crimes
+#### 5. Camera Live View (RTSP Stream)
+
+The police station can view live camera feeds directly in the Flutter app using RTSP streaming.
+
+```
+GET /api/v1/police-station/cameras/{id}/live
+```
+
+**Response:**
+```json
+{
+  "status": true,
+  "data": {
+    "camera_id": 3,
+    "camera_name": "Main Entrance",
+    "encrypted_stream_data": "BASE64_AES_ENCRYPTED_STRING"
+  }
+}
+```
+
+**Decrypted `encrypted_stream_data` contains:**
+```json
+{
+  "rtsp_url": "rtsp://admin:camera123@41.35.100.50:8554/stream1",
+  "rtsp_url_sub": "rtsp://admin:camera123@41.35.100.50:8554/stream2"
+}
+```
+
+- Use `stream1` for high-quality view, `stream2` for lower bandwidth
+- **Decrypt** the `encrypted_stream_data` using the `encryption_key` from login (see Encryption section above)
+- Use `flutter_vlc_player` or `media_kit` package to play RTSP:
+
+```dart
+// Using flutter_vlc_player
+VlcPlayerController.network(
+  decryptedData['rtsp_url_sub'], // Use stream2 for mobile
+  hwAcc: HwAcc.full,
+  autoPlay: true,
+  options: VlcPlayerOptions(),
+);
+
+// Using media_kit
+final player = Player();
+player.open(Media(decryptedData['rtsp_url_sub']));
+```
+
+**Important:** RTSP streaming is supported on **Android and iOS only** — NOT on web.
+
+#### 6. Camera Control
+
+Police stations have full camera control via these endpoints:
+
+```
+POST /api/v1/police-station/cameras/{camera}/control/alarm        → on|off|start|stop|status|config
+POST /api/v1/police-station/cameras/{camera}/control/privacy      → on|off|status
+POST /api/v1/police-station/cameras/{camera}/control/led          → on|off|status
+POST /api/v1/police-station/cameras/{camera}/control/motion       → on|off|status
+POST /api/v1/police-station/cameras/{camera}/control/person       → on|off|status
+POST /api/v1/police-station/cameras/{camera}/control/move         → PTZ direction
+POST /api/v1/police-station/cameras/{camera}/control/goto-preset  → Go to preset
+POST /api/v1/police-station/cameras/{camera}/control/motor        → move|calibrate
+POST /api/v1/police-station/cameras/{camera}/control/autotrack    → on|off|status
+POST /api/v1/police-station/cameras/{camera}/control/cruise       → on|off|status
+POST /api/v1/police-station/cameras/{camera}/control/preset       → list|set|save|delete
+POST /api/v1/police-station/cameras/{camera}/control/recordings   → list|get
+POST /api/v1/police-station/cameras/{camera}/control/stream-url   → Get RTSP URL
+POST /api/v1/police-station/cameras/{camera}/control/basic-info   → Device info
+POST /api/v1/police-station/cameras/{camera}/control/status       → Full status
+POST /api/v1/police-station/cameras/{camera}/control/daynight     → set|status|config
+POST /api/v1/police-station/cameras/{camera}/control/flip         → on|off|status
+POST /api/v1/police-station/cameras/{camera}/control/ldc          → on|off|status
+POST /api/v1/police-station/cameras/{camera}/control/osd          → set|status
+POST /api/v1/police-station/cameras/{camera}/control/sdcard       → status|format
+POST /api/v1/police-station/cameras/{camera}/control/reboot       → Reboot camera
+```
+
+#### 7. Crimes
 
 ```
 GET  /api/v1/police-station/crimes                 → List with filters
@@ -477,7 +626,7 @@ POST /api/v1/police-station/crimes/{id}/assign
 Body: { "officer_id": 5 }
 ```
 
-#### 6. Chat
+#### 8. Chat
 
 ```
 GET  /api/v1/police-station/chat/conversations     → List all officer chats
@@ -495,7 +644,7 @@ POST /api/v1/police-station/chat/{officer_id}       → Send message
 
 | Method | Endpoint | Description |
 |--------|----------|-------------|
-| POST | `/{guard}/login` | Login |
+| POST | `/{guard}/login` | Login (returns token + encryption_key) |
 | POST | `/{guard}/logout` | Logout |
 | GET | `/{guard}/profile` | Get profile |
 | PUT | `/{guard}/profile` | Update profile |
@@ -506,6 +655,12 @@ POST /api/v1/police-station/chat/{officer_id}       → Send message
 | DELETE | `/{guard}/firebase-token` | Remove FCM token |
 | GET | `/{guard}/dashboard` | Dashboard stats |
 | GET | `/{guard}/statistics` | Statistics by period |
+
+### Public Endpoints (no auth required)
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| GET | `/settings/language` | Get system language (ar/en) |
 
 ### Officer-Only Endpoints (`{guard}` = `officer`)
 
@@ -521,6 +676,12 @@ POST /api/v1/police-station/chat/{officer_id}       → Send message
 | PUT | `/officer/status` | Update availability status |
 | GET | `/officer/chat` | Chat messages with station |
 | POST | `/officer/chat` | Send message to station |
+| POST | `/officer/cameras/{camera}/control/alarm` | Trigger/stop camera alarm (start\|stop only) |
+| POST | `/officer/cameras/{camera}/control/move` | PTZ camera movement |
+| POST | `/officer/cameras/{camera}/control/goto-preset` | Go to camera preset |
+| POST | `/officer/cameras/{camera}/control/preset` | List presets only |
+| POST | `/officer/cameras/{camera}/control/recordings` | List/get recordings |
+| POST | `/officer/cameras/{camera}/control/stream-url` | Get RTSP stream URL |
 
 ### Police Station-Only Endpoints (`{guard}` = `police-station`)
 
@@ -544,6 +705,8 @@ POST /api/v1/police-station/chat/{officer_id}       → Send message
 | GET | `/police-station/chat/{officer}` | Messages with officer |
 | POST | `/police-station/chat/{officer}` | Send message |
 | PUT | `/police-station/officers/{id}/reset-password` | Reset officer password |
+| GET | `/police-station/cameras/{id}/live` | Get encrypted live stream URL |
+| POST | `/police-station/cameras/{camera}/control/*` | Full camera control (21 endpoints) |
 
 ---
 
@@ -679,7 +842,7 @@ FirebaseMessaging.instance.getInitialMessage().then((message) {
 - **Police Station** chats with any of their officers (1-to-many conversations)
 - Messages are delivered in real-time via Pusher
 - Push notification sent when recipient's app is in background
-- Supports: text messages, images, files
+- Supports: text messages only (no file/image attachments)
 
 ### Chat Conversation Key
 
@@ -695,8 +858,6 @@ Subscribe to: `private-chat.station_1_officer_5`
 {
   "id": 1,
   "message": "Report to sector 5 immediately",
-  "type": "text",
-  "file_path": null,
   "sender": { "id": 2, "name": "Station Commander", "type": "police_station" },
   "is_read": false,
   "created_at": "2026-02-27T14:30:00Z"
@@ -711,16 +872,7 @@ POST /api/v1/officer/chat
 POST /api/v1/police-station/chat/{officer_id}
 
 Body: {
-  "message": "I'm on my way to the scene",
-  "type": "text"
-}
-
-// For image/file:
-Content-Type: multipart/form-data
-Body: {
-  "message": "See this photo",
-  "type": "image",
-  "file": <image_file>
+  "message": "I'm on my way to the scene"
 }
 ```
 
@@ -800,9 +952,11 @@ All API errors follow this format:
 ### Token Expiration
 
 If you get a `401` response, the token is expired or invalid:
-1. Clear stored token
+1. Clear stored token and encryption key
 2. Redirect to login screen
 3. Show "Session expired, please login again"
+
+Note: Tokens have a **7-day expiry**. After 7 days, the user must login again (which also regenerates the encryption key).
 
 ---
 
@@ -838,11 +992,14 @@ pending → assigned → in_progress → visited → resolved
 
 ## Important Notes
 
-### 1. Language Support
-- The API supports both Arabic (`ar`) and English (`en`)
-- Crime types have both `name_en` and `name_ar`
-- Show the appropriate language based on device locale
-- Error messages come in both languages (server-side)
+### 1. Language Support (Server-Controlled)
+- The app language is controlled by the **admin** from the dashboard — NOT by the user
+- On app startup (before login), call `GET /api/v1/settings/language` to get the system language
+- Supported languages: Arabic (`ar`, RTL) and English (`en`, LTR)
+- Crime types have both `name_en` and `name_ar` — display based on system language
+- Error messages come from the server in the configured system language
+- Cache the language locally for offline use, refresh on every startup
+- Do NOT add any language toggle or language picker in the app UI
 
 ### 2. Pagination
 - All list endpoints support pagination: `?page=1`
@@ -854,10 +1011,9 @@ pending → assigned → in_progress → visited → resolved
 - Crime list: filter by status, severity, date range, camera, officer
 - Pass filters as query params: `?status=pending&severity=high`
 
-### 4. Image/File URLs
+### 4. Media URLs
 - Scene evidence path: prepend base URL → `https://{server}{sence_path}`
-- Thumbnail path: prepend base URL → `https://{server}{thumbnail_path}`
-- Chat file path: prepend base URL → `https://{server}{file_path}`
+- Avatar paths: prepend base URL → `https://{server}{avatar_path}`
 
 ### 5. Date/Time Format
 - All dates from API are in ISO 8601 format: `2026-02-27T14:30:00Z`
