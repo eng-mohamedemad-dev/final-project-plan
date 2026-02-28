@@ -28,22 +28,22 @@ Buffer   (Week 9-10)  → Bug fixes, Final testing, Deployment prep
 |-----|--------------|-------------------|-------------------|
 | 1-2 | Phase 1: Database migrations + Models + Enums + Factories + Seeders | Setup Flutter project structure, shared packages (dio, provider/riverpod, pusher, firebase) | Review MODEL_GUIDE.md, understand API contract |
 | 3 | Phase 2: Architecture setup — base controller, ApiResponse, base service classes, middleware skeleton | Auth screens UI (login for officer + police station) | Setup Python project, prepare RTSP stream reader |
-| 4-5 | Phase 3: Multi-guard auth (config/auth.php, guards, Sanctum, AuthController, ResolveGuardMiddleware) | Connect login to API (once auth API is ready), token storage | Implement camera claiming logic + heartbeat sender |
+| 4-5 | Phase 3: Multi-guard auth (config/auth.php, 4 guards, Sanctum, AuthController, ResolveGuardMiddleware, VerifyModelIpMiddleware) | Connect login to API (once auth API is ready), token storage | Implement login flow + AES-256-CBC decryption for camera data |
 
 ### Week 2
 
 | Day | Backend (أنت) | Flutter Developer | AI Model Developer |
 |-----|--------------|-------------------|-------------------|
-| 1-2 | Phase 5: Officer API — CrimeController, LocationController, StatusController + Services | Officer app: Crime list screen, crime detail screen, map view | Test camera claiming against backend (mock or real) |
-| 3-4 | Phase 4: Police Station API — OfficerController, CameraController, CrimeController + Services | Police Station app: Officers list, cameras list, crimes list | Implement alert sending (POST /api/model/alert) |
+| 1-2 | Phase 5: Officer API — CrimeController, LocationController, StatusController + Services | Officer app: Crime list screen, crime detail screen, map view | Test login + camera fetch + decryption against backend |
+| 3-4 | Phase 4: Police Station API — OfficerController, CameraController, CrimeController + Services + password reset | Police Station app: Officers list (with new fields), cameras list, crimes list | Implement alert sending (POST /api/model/alert) |
 | 5 | Shared routes: Profile, Notifications, Firebase Token, Dashboard endpoints | Profile screen, notifications list (shared for both apps) | Implement crime reporting (POST /api/model/crime) |
 
 **Sprint 1 Deliverables:**
 - ✅ Database fully migrated with seed data
-- ✅ Auth working for all 3 guards (login/logout/token)
+- ✅ Auth working for all 4 guards (admin, police_station, officer, ai_model)
 - ✅ Core CRUD APIs for officer + police station apps
 - ✅ Flutter apps can login and fetch data
-- ✅ Model can claim cameras and send alerts/crimes
+- ✅ Model can login, decrypt camera data, and send alerts/crimes
 
 ---
 
@@ -53,9 +53,9 @@ Buffer   (Week 9-10)  → Bug fixes, Final testing, Deployment prep
 
 | Day | Backend (أنت) | Flutter Developer | AI Model Developer |
 |-----|--------------|-------------------|-------------------|
-| 1-2 | Phase 6: AI Model Integration API — AiModelController, ModelApiKeyMiddleware, CrimeService (full crime creation flow) | Officer app: Accept/arrive/decline/resolve crime actions | Integrate with real RTSP streams from Tapo cameras |
-| 3-4 | Phase 3 (Dashboard): Admin login + Dashboard page (Livewire) — metrics cards, charts | Police Station app: Create/edit officer, create/edit camera forms | Implement direct camera alarm triggering |
-| 5 | Admin Dashboard: Police Stations CRUD (list, create, edit, delete) | Officer app: GPS location tracking (background service) | Implement confidence scoring + crime type detection |
+| 1-2 | Phase 6: AI Model Integration API — AiModelController, VerifyModelIpMiddleware, EncryptionService, CrimeService (full crime creation flow) | Officer app: Accept/arrive/decline/resolve crime actions | Integrate with real RTSP streams from Tapo cameras |
+| 3-4 | Phase 3 (Dashboard): Admin login + Dashboard page (Livewire) — metrics cards, charts | Police Station app: Create/edit officer (with national_id, rank, badge_number), create/edit camera forms | Implement direct camera alarm triggering |
+| 5 | Admin Dashboard: Police Stations CRUD + AI Models CRUD (with camera assignment checkboxes) | Officer app: GPS location tracking (background service) | Implement confidence scoring + crime type detection |
 
 ### Week 4
 
@@ -67,7 +67,7 @@ Buffer   (Week 9-10)  → Bug fixes, Final testing, Deployment prep
 
 **Sprint 2 Deliverables:**
 - ✅ Full crime detection → assignment flow working end-to-end
-- ✅ Admin dashboard functional with CRUD + charts
+- ✅ Admin dashboard functional with CRUD (police stations + AI models) + charts
 - ✅ Excel import working for all entities
 - ✅ Officer auto-assignment by proximity
 - ✅ Flutter apps have all CRUD screens
@@ -82,8 +82,8 @@ Buffer   (Week 9-10)  → Bug fixes, Final testing, Deployment prep
 | Day | Backend (أنت) | Flutter Developer | AI Model Developer |
 |-----|--------------|-------------------|-------------------|
 | 1-2 | Phase 7: Real-time — Pusher events (CrimeDetected, CrimeStatusUpdated, OfficerLocationUpdated), channel auth | Integrate Pusher in Flutter — listen to crime events, status updates | Implement heartbeat mechanism (every 60s) |
-| 3-4 | Phase 7: Firebase — FirebaseService, SendCrimeNotification job, FCM push notifications | Integrate Firebase push notifications (foreground + background handlers) | Handle camera release on shutdown/crash |
-| 5 | Phase 7: Escalation — EscalationService, scheduled task, auto-reassignment | Real-time UI updates: crime status changes, new notifications | Test multi-instance load balancing (multiple model servers) |
+| 3-4 | Phase 7: Firebase — FirebaseService, SendCrimeNotification job, FCM push notifications | Integrate Firebase push notifications (foreground + background handlers) | Handle graceful shutdown + reconnection on crash |
+| 5 | Phase 7: Escalation — EscalationService, scheduled task, auto-reassignment | Real-time UI updates: crime status changes, new notifications | Test multi-instance deployment (multiple model servers) |
 
 ### Week 6
 
@@ -188,7 +188,7 @@ These are the absolute minimum features needed for a working graduation demo:
 | 🔴 P0 | Multi-guard Auth (login/logout) | Phase 3 | 2 |
 | 🔴 P0 | Officer API (crimes, location, status) | Phase 5 | 3 |
 | 🔴 P0 | Police Station API (officers, cameras, crimes) | Phase 4 | 3 |
-| 🔴 P0 | AI Model API (claim, alert, crime) | Phase 6 | 3 |
+| 🔴 P0 | AI Model API (login, cameras, alert, crime) | Phase 6 | 3 |
 | 🔴 P0 | Crime detection → assignment flow | Phase 6+9 | 2 |
 | 🟡 P1 | Push notifications (Firebase) | Phase 7 | 2 |
 | 🟡 P1 | Real-time updates (Pusher) | Phase 7 | 2 |
@@ -211,7 +211,7 @@ These are the absolute minimum features needed for a working graduation demo:
 | When | What | Who |
 |------|------|-----|
 | End of Week 1 | Auth API ready → Flutter can start integrating | Backend → Flutter |
-| End of Week 1 | Model API contract finalized → Model can start implementing | Backend → Model |
+| End of Week 1 | Model API contract finalized (login + encryption) → Model can start implementing | Backend → Model |
 | End of Week 2 | CRUD APIs ready → Flutter builds full screens | Backend → Flutter |
 | Mid Week 3 | Crime flow API ready → full end-to-end test | All |
 | End of Week 4 | Excel import ready → Flutter adds upload UI | Backend → Flutter |

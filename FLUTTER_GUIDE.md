@@ -127,7 +127,8 @@ POST /api/v1/{guard}/login
       "id": 1,
       "name": "Ahmed Mohamed",
       "email": "officer@example.com",
-      "phone": "01012345678"
+      "phone": "01012345678",
+      "avatar": "/storage/avatars/officer_1.jpg"
     }
   }
 }
@@ -169,7 +170,7 @@ Revokes the token on the server side.
 | 2 | **Home / Crime List** | List of crimes assigned to this officer or within 5km |
 | 3 | **Crime Detail** | Full crime info + scene video + location on map |
 | 4 | **Map View** | Map showing nearby crime locations |
-| 5 | **Profile** | View/edit name, email, phone, password |
+| 5 | **Profile** | View/edit name, email, phone, password, avatar upload |
 | 6 | **Notifications** | List of all notifications |
 | 7 | **Chat** | Chat with police station |
 | 8 | **Status Toggle** | Change availability (available/busy/offline) |
@@ -313,7 +314,7 @@ GET /api/v1/officer/statistics?period=weekly
 | 12 | **Crime Manual Assignment** | Assign crime to specific officer |
 | 13 | **Chat Conversations** | List of chats with officers |
 | 14 | **Chat Thread** | Chat with specific officer |
-| 15 | **Profile** | View/edit station profile |
+| 15 | **Profile** | View/edit station profile (name, email, phone, address, city, governorate, avatar) |
 | 16 | **Notifications** | List of all notifications |
 | 17 | **Statistics** | Crime stats by period |
 
@@ -368,8 +369,17 @@ DELETE /api/v1/police-station/officers/{id}          → Delete
   "email": "ahmed@police.gov.eg",
   "phone": "01012345678",
   "password": "securepass123",
+  "national_id": "29901011234567",
+  "rank": "Lieutenant",
+  "badge_number": "B-1234",
   "is_on_shift": true
 }
+```
+
+**Reset Officer Password:**
+```
+PUT /api/v1/police-station/officers/{id}/reset-password
+Body: { "password": "newSecurePassword" }
 ```
 
 **Officers on Map:**
@@ -391,9 +401,9 @@ Body: file={excel_file}
 ```
 
 **Excel format (columns):**
-| name | email | phone | password |
-|------|-------|-------|----------|
-| Ahmed | ahmed@police.gov.eg | 01012345678 | pass123 |
+| name | email | phone | password | national_id | rank | badge_number |
+|------|-------|-------|----------|-------------|------|-------------|
+| Ahmed | ahmed@police.gov.eg | 01012345678 | pass123 | 29901011234567 | Lieutenant | B-1234 |
 
 **Response:**
 ```json
@@ -533,6 +543,7 @@ POST /api/v1/police-station/chat/{officer_id}       → Send message
 | GET | `/police-station/chat/conversations` | Chat list |
 | GET | `/police-station/chat/{officer}` | Messages with officer |
 | POST | `/police-station/chat/{officer}` | Send message |
+| PUT | `/police-station/officers/{id}/reset-password` | Reset officer password |
 
 ---
 

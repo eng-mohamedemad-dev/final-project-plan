@@ -12,9 +12,9 @@
 2. [Architecture Overview](#architecture-overview)
 3. [Complete Flow](#complete-flow)
 4. [API Authentication](#api-authentication)
-5. [API Reference](#api-reference)
-6. [Camera Alarm — Direct Trigger](#camera-alarm)
-7. [Load Balancing](#load-balancing)
+5. [Encryption — Decrypting Camera Data](#encryption)
+6. [API Reference](#api-reference)
+7. [Camera Alarm — Direct Trigger](#camera-alarm)
 8. [Heartbeat Mechanism](#heartbeat-mechanism)
 9. [Error Handling & Edge Cases](#error-handling)
 10. [Configuration](#configuration)
@@ -28,25 +28,28 @@
 
 You are responsible for building a **Python service** that:
 
-1. **Fetches cameras** from the Laravel backend
-2. **Watches RTSP video streams** from Tapo C200 cameras
-3. **Detects crimes/suspicious activity** using your AI model
-4. **Triggers the camera alarm directly** (fast response)
-5. **Reports alerts and crimes** back to the Laravel backend via webhook API
-6. **Sends heartbeats** every 60 seconds to indicate healthy operation
+1. **Logs in** to the Laravel backend (email + password — admin registers your model)
+2. **Fetches assigned cameras** from the Laravel backend (admin assigns cameras to your model)
+3. **Decrypts camera credentials** (AES-256-CBC encrypted for security)
+4. **Watches RTSP video streams** from Tapo C200 cameras
+5. **Detects crimes/suspicious activity** using your AI model
+6. **Triggers the camera alarm directly** (fast response)
+7. **Reports alerts and crimes** back to the Laravel backend via webhook API
+8. **Sends heartbeats** every 60 seconds to indicate healthy operation
 
 ```
 ┌──────────────────────────────────────────────────────┐
-│                   Your Service                        │
+│                   Your Service                       │
 │                                                      │
-│  1. Fetch cameras (GET /api/model/cameras)           │
-│  2. Claim cameras (POST /api/model/cameras/{id}/claim)│
-│  3. Watch RTSP streams (rtsp://user:pass@ip/stream2) │
-│  4. Run AI detection on frames                       │
-│  5. If suspicious → trigger alarm + POST /alert      │
-│  6. If confirmed  → POST /api/model/crime            │
-│  7. If cleared    → stop alarm + POST /alert/stop    │
-│  8. Heartbeat every 60s (POST /api/model/heartbeat)  │
+│  1. Login (POST /api/model/login)                    │
+│  2. Fetch assigned cameras (GET /api/model/cameras)  │
+│  3. Decrypt camera credentials (AES-256-CBC)         │
+│  4. Watch RTSP streams (rtsp://user:pass@ip/stream2) │
+│  5. Run AI detection on frames                       │
+│  6. If suspicious → trigger alarm + POST /alert      │
+│  7. If confirmed  → POST /api/model/crime            │
+│  8. If cleared    → stop alarm + POST /alert/stop    │
+│  9. Heartbeat every 60s (POST /api/model/heartbeat)  │
 │                                                      │
 └──────────────────────────────────────────────────────┘
 ```
@@ -64,7 +67,7 @@ You are responsible for building a **Python service** that:
 
 ```
                     ┌─────────────────────┐
-                    │    Laravel Backend   │
+                    │    Laravel Backend  │
                     │   (API Server)      │
                     │                     │
                     │  - Creates crime    │
@@ -73,13 +76,16 @@ You are responsible for building a **Python service** that:
                     │  - Extracts scene   │
                     └─────┬───────┬───────┘
                           │       │
-              GET cameras │       │ POST alert/crime
-              Claim       │       │
+             Login + GET  │       │ POST alert/crime
+             cameras      │       │
+             (encrypted)  │       │
                           │       │
                     ┌─────┴───────┴───────┐
                     │   Your AI Model     │
                     │   (Python Service)  │
                     │                     │
+                    │  - Logs in (Sanctum)│
+                    │  - Decrypts creds   │
                     │  - Watches streams  │
                     │  - Runs detection   │
                     │  - Reports crimes   │
@@ -88,7 +94,7 @@ You are responsible for building a **Python service** that:
               RTSP stream │  + Direct alarm trigger
                           │
                     ┌─────┴───────────────┐
-                    │   Tapo C200 Cameras  │
+                    │   Tapo C200 Cameras │
                     │   (192.168.x.x)     │
                     └─────────────────────┘
 ```
@@ -97,23 +103,42 @@ You are responsible for building a **Python service** that:
 
 ## Complete Flow
 
-### Step 1: Startup — Fetch & Claim Cameras
+### Step 1: Startup — Login & Fetch Assigned Cameras
 
 ```python
-# On startup, fetch available (unclaimed) cameras
+import base64
+import json
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from cryptography.hazmat.primitives import padding
+
+# Login to get Sanctum token
+login_response = requests.post(
+    f"{BACKEND_URL}/api/model/login",
+    json={
+        "email": MODEL_EMAIL,
+        "password": MODEL_PASSWORD
+    }
+)
+token = login_response.json()["data"]["token"]
+headers = {"Authorization": f"Bearer {token}"}
+
+# Fetch cameras assigned to this model by admin
 response = requests.get(
     f"{BACKEND_URL}/api/model/cameras",
-    headers={"X-Model-Api-Key": API_KEY}
+    headers=headers
 )
-cameras = response.json()["data"]
-# Returns max 10 unclaimed, active cameras
+cameras_raw = response.json()["data"]
 
-# Claim each camera (so other model instances don't process it)
-for camera in cameras:
-    requests.post(
-        f"{BACKEND_URL}/api/model/cameras/{camera['id']}/claim",
-        headers={"X-Model-Api-Key": API_KEY}
-    )
+# Decrypt camera credentials
+cameras = []
+for cam in cameras_raw:
+    decrypted = decrypt_camera_data(cam["encrypted_data"], ENCRYPTION_KEY)
+    cam_data = {
+        **cam,
+        **decrypted  # ip_address, rtsp_url, user_name, password, connection_ip, etc.
+    }
+    del cam_data["encrypted_data"]
+    cameras.append(cam_data)
 ```
 
 ### Step 2: Watch RTSP Streams
@@ -121,10 +146,10 @@ for camera in cameras:
 ```python
 import cv2
 
-# Each camera comes with a full RTSP URL
+# Each camera has decrypted rtsp_url ready to use
 # Use stream2 (low quality) for AI processing — less bandwidth
 rtsp_url = camera["rtsp_url"]
-# Example: rtsp://mohamed:m0ohamed123456789@192.168.1.6:554/stream2
+# Example: rtsp://mohamed:m0ohamed123456789@41.35.120.50:8554/stream2
 
 cap = cv2.VideoCapture(rtsp_url)
 while cap.isOpened():
@@ -148,7 +173,7 @@ if prediction.confidence > ALERT_THRESHOLD:
     # 2. Notify backend
     requests.post(
         f"{BACKEND_URL}/api/model/alert",
-        headers={"X-Model-Api-Key": API_KEY},
+        headers=headers,
         json={
             "camera_id": camera["id"],
             "confidence_score": prediction.confidence,
@@ -164,7 +189,7 @@ When your model confirms a crime (high confidence, sustained detection):
 ```python
 requests.post(
     f"{BACKEND_URL}/api/model/crime",
-    headers={"X-Model-Api-Key": API_KEY},
+    headers=headers,
     json={
         "camera_id": camera["id"],
         "crime_type": "theft",         # or: assault, vandalism, break_in, suspicious_activity
@@ -194,7 +219,7 @@ stop_camera_alarm(camera)
 # 2. Notify backend
 requests.post(
     f"{BACKEND_URL}/api/model/alert/stop",
-    headers={"X-Model-Api-Key": API_KEY},
+    headers=headers,
     json={
         "camera_id": camera["id"]
     }
@@ -210,9 +235,9 @@ def send_heartbeat():
     while running:
         requests.post(
             f"{BACKEND_URL}/api/model/heartbeat",
-            headers={"X-Model-Api-Key": API_KEY},
+            headers=headers,
             json={
-                "camera_ids": [cam["id"] for cam in claimed_cameras]
+                "camera_ids": [cam["id"] for cam in cameras]
             }
         )
         time.sleep(60)
@@ -226,15 +251,103 @@ heartbeat_thread.start()
 
 ## API Authentication
 
-All API endpoints are secured with an API key. Include it in every request:
+Your model authenticates using **email + password** login, just like other users in the system. The admin registers your model instance from the dashboard and gives you:
 
+- **Email** — your model's login email
+- **Password** — your model's login password
+- **Encryption Key** — AES-256-CBC key for decrypting camera data
+
+### Login Flow
+
+```python
+# Step 1: Login to get a Sanctum Bearer token
+response = requests.post(f"{BACKEND_URL}/api/model/login", json={
+    "email": "model1@system.local",
+    "password": "your_password_here"
+})
+token = response.json()["data"]["token"]
+
+# Step 2: Use the token in all subsequent requests
+headers = {"Authorization": f"Bearer {token}"}
 ```
-Header: X-Model-Api-Key: {your_api_key}
+
+### IP Verification
+
+The backend verifies your IP address on **every request** (including login). Your model's IP must match the whitelisted `ip_address` configured by the admin. If your IP changes, ask the admin to update it.
+
+**Error (403 — IP mismatch):**
+```json
+{
+  "status": false,
+  "message": "Request IP does not match the whitelisted IP address for this model"
+}
 ```
 
-The API key will be stored in the backend's `.env` file as `MODEL_API_KEY`. The backend developer will share this key with you.
+---
 
-**You do NOT use Sanctum tokens or login.** The model API key is a simple static key for service-to-service authentication.
+## Encryption
+
+### Why Encryption?
+
+Camera credentials (usernames, passwords, RTSP URLs) are sensitive. To prevent interception, the backend encrypts them with AES-256-CBC before sending them to you. You decrypt them locally.
+
+### Decryption Implementation
+
+```python
+import base64
+import json
+import hashlib
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from cryptography.hazmat.primitives import padding as sym_padding
+from cryptography.hazmat.backends import default_backend
+
+def decrypt_camera_data(encrypted_payload: str, encryption_key: str) -> dict:
+    """
+    Decrypt camera data encrypted by Laravel's AES-256-CBC.
+    
+    Laravel's encrypt() produces a base64-encoded JSON with:
+    - iv: base64-encoded initialization vector
+    - value: base64-encoded encrypted data
+    - mac: HMAC for integrity verification
+    """
+    payload = json.loads(base64.b64decode(encrypted_payload))
+    
+    iv = base64.b64decode(payload["iv"])
+    value = base64.b64decode(payload["value"])
+    
+    # Derive key (Laravel uses the raw key from config)
+    key = base64.b64decode(encryption_key)
+    
+    # Decrypt
+    cipher = Cipher(algorithms.AES(key), modes.CBC(iv), backend=default_backend())
+    decryptor = cipher.decryptor()
+    decrypted_padded = decryptor.update(value) + decryptor.finalize()
+    
+    # Remove PKCS7 padding
+    unpadder = sym_padding.PKCS7(128).unpadder()
+    decrypted = unpadder.update(decrypted_padded) + unpadder.finalize()
+    
+    return json.loads(decrypted)
+```
+
+### Decrypted Data Structure
+
+```json
+{
+  "ip_address": "192.168.1.6",
+  "connection_ip": "41.35.120.50",
+  "connection_port": 8554,
+  "rtsp_url": "rtsp://mohamed:m0ohamed123456789@41.35.120.50:8554/stream2",
+  "user_name": "mohamed",
+  "password": "m0ohamed123456789",
+  "api_port": 8443,
+  "onvif_port": 8080
+}
+```
+
+### Key Management
+
+The encryption key (`MODEL_ENCRYPTION_KEY`) is shared between the Laravel backend and your model. Store it securely in your environment variables — never hardcode it.
 
 ---
 
@@ -244,14 +357,69 @@ The API key will be stored in the backend's `.env` file as `MODEL_API_KEY`. The 
 
 ---
 
-### 1. GET `/cameras` — List Available Cameras
+### 1. POST `/login` — Authenticate Model
 
-Fetch unclaimed, active cameras ready for processing.
+Login with your email and password to receive a Sanctum bearer token.
+
+**Request:**
+```http
+POST /api/model/login
+Content-Type: application/json
+
+{
+  "email": "model1@system.local",
+  "password": "your_password"
+}
+```
+
+**Response (200):**
+```json
+{
+  "status": true,
+  "message": "Login successful",
+  "data": {
+    "token": "1|abc123def456...",
+    "model": {
+      "id": 1,
+      "name": "Model Instance 1",
+      "email": "model1@system.local",
+      "ip_address": "41.35.120.50"
+    }
+  }
+}
+```
+
+**Error (401 — invalid credentials):**
+```json
+{
+  "status": false,
+  "message": "Invalid credentials"
+}
+```
+
+**Error (403 — IP mismatch):**
+```json
+{
+  "status": false,
+  "message": "Request IP does not match the whitelisted IP address for this model"
+}
+```
+
+**Important:**
+- Your request IP must match the whitelisted `ip_address` the admin configured
+- Save the token and include it as `Authorization: Bearer {token}` in all subsequent requests
+- The token does not expire until you log out or the admin revokes it
+
+---
+
+### 2. GET `/cameras` — List Assigned Cameras
+
+Fetch cameras that the admin has assigned to your model instance. Camera credentials are **encrypted**.
 
 **Request:**
 ```http
 GET /api/model/cameras
-X-Model-Api-Key: {key}
+Authorization: Bearer {token}
 ```
 
 **Response (200):**
@@ -262,12 +430,7 @@ X-Model-Api-Key: {key}
     {
       "id": 1,
       "name": "Main Entrance",
-      "ip_address": "192.168.1.6",
-      "connection_ip": "41.35.120.50",
-      "connection_port": 8554,
-      "rtsp_url": "rtsp://mohamed:m0ohamed123456789@41.35.120.50:8554/stream2",
-      "user_name": "mohamed",
-      "password": "m0ohamed123456789",
+      "encrypted_data": "eyJpdiI6Ik...(base64 encoded AES-256-CBC encrypted JSON)...",
       "lat": 30.0444,
       "lang": 31.2357,
       "storage_type": "none",
@@ -276,12 +439,7 @@ X-Model-Api-Key: {key}
     {
       "id": 2,
       "name": "Back Gate",
-      "ip_address": "192.168.1.7",
-      "connection_ip": null,
-      "connection_port": 554,
-      "rtsp_url": "rtsp://admin:pass123@192.168.1.7:554/stream2",
-      "user_name": "admin",
-      "password": "pass123",
+      "encrypted_data": "eyJpdiI6Im...",
       "lat": 30.0450,
       "lang": 31.2360,
       "storage_type": "sd_card",
@@ -292,83 +450,23 @@ X-Model-Api-Key: {key}
 ```
 
 **Important:**
-- Returns **max 10** cameras per request
-- Only returns cameras where `is_active = true` AND `model_ip_address IS NULL` (unclaimed)
-- `rtsp_url` is a **complete, ready-to-use** RTSP URL — connect directly with OpenCV
+- Returns **only cameras assigned to your model** by the admin
+- Only returns cameras where `is_active = true`
+- The `encrypted_data` field must be decrypted using the `MODEL_ENCRYPTION_KEY` (see [Encryption](#encryption) section)
+- After decryption, you get: `ip_address`, `connection_ip`, `connection_port`, `rtsp_url`, `user_name`, `password`, `api_port`, `onvif_port`
 - Use `stream2` (low quality) for AI processing to save bandwidth
 - `storage_type` tells you how the backend records evidence — you don't need to worry about this
 
 ---
 
-### 2. POST `/cameras/{id}/claim` — Claim a Camera
-
-Tell the backend this model instance is processing this camera.
-
-**Request:**
-```http
-POST /api/model/cameras/1/claim
-X-Model-Api-Key: {key}
-```
-
-**Response (200):**
-```json
-{
-  "status": true,
-  "message": "Camera claimed successfully"
-}
-```
-
-**Error (409 — already claimed):**
-```json
-{
-  "status": false,
-  "message": "Camera is already claimed by another model instance"
-}
-```
-
-**Error (422 — limit reached):**
-```json
-{
-  "status": false,
-  "message": "Maximum camera limit reached (10). Release cameras before claiming new ones."
-}
-```
-
----
-
-### 3. DELETE `/cameras/{id}/release` — Release a Camera
-
-Release a camera so other model instances can pick it up.
-
-**Request:**
-```http
-DELETE /api/model/cameras/1/release
-X-Model-Api-Key: {key}
-```
-
-**Response (200):**
-```json
-{
-  "status": true,
-  "message": "Camera released successfully"
-}
-```
-
-**When to release:**
-- Camera stream is unreachable (camera offline)
-- Your service is shutting down gracefully
-- You want to switch to different cameras
-
----
-
-### 4. POST `/heartbeat` — Send Heartbeat
+### 3. POST `/heartbeat` — Send Heartbeat
 
 Tell the backend your model is still alive and processing cameras.
 
 **Request:**
 ```http
 POST /api/model/heartbeat
-X-Model-Api-Key: {key}
+Authorization: Bearer {token}
 Content-Type: application/json
 
 {
@@ -385,20 +483,19 @@ Content-Type: application/json
 ```
 
 **CRITICAL:** Send heartbeat every **60 seconds**. If the backend doesn't receive a heartbeat for **2 minutes**, it will:
-1. Release all cameras claimed by your model instance
-2. Make them available for other model instances
-3. Log the event
+1. Mark your model as inactive (`is_active = false`)
+2. Log the event
 
 ---
 
-### 5. POST `/alert` — Report Suspicious Activity
+### 4. POST `/alert` — Report Suspicious Activity
 
 Send when your model first detects something suspicious (before confirming it's a crime).
 
 **Request:**
 ```http
 POST /api/model/alert
-X-Model-Api-Key: {key}
+Authorization: Bearer {token}
 Content-Type: application/json
 
 {
@@ -425,14 +522,14 @@ Content-Type: application/json
 
 ---
 
-### 6. POST `/alert/stop` — Scene Ended
+### 5. POST `/alert/stop` — Scene Ended
 
 Report that the suspicious activity has ended.
 
 **Request:**
 ```http
 POST /api/model/alert/stop
-X-Model-Api-Key: {key}
+Authorization: Bearer {token}
 Content-Type: application/json
 
 {
@@ -452,14 +549,14 @@ Content-Type: application/json
 
 ---
 
-### 7. POST `/crime` — Report Confirmed Crime
+### 6. POST `/crime` — Report Confirmed Crime
 
 Send when your model has confirmed with high confidence that a crime occurred.
 
 **Request:**
 ```http
 POST /api/model/crime
-X-Model-Api-Key: {key}
+Authorization: Bearer {token}
 Content-Type: application/json
 
 {
@@ -525,7 +622,7 @@ Speed matters. If you route the alarm through the backend (Model → Backend →
 
 ### How to Trigger
 
-The Tapo C200 cameras have an HTTP API for alarm control. Since you already have the camera credentials from the `/cameras` API:
+The Tapo C200 cameras have an HTTP API for alarm control. Since you have the camera credentials from the API (after decryption):
 
 #### Option A: Use the Existing Backend Camera API (Simpler)
 
@@ -603,54 +700,28 @@ cam = ONVIFCamera(
 
 ---
 
-## Load Balancing
-
-### Why?
-
-Each model instance handles a **maximum of 10 cameras**. If you have 30 cameras, you need 3 model instances.
+## Camera Assignment (Admin-Managed)
 
 ### How It Works
 
+Camera assignment is **controlled entirely by the admin** from the dashboard. You do NOT choose which cameras to process — the admin assigns them to your model instance.
+
 ```
-Model Instance 1 (192.168.1.100)
-├── Claims cameras 1-10
-├── Sets model_ip_address = "192.168.1.100"
-└── Processes 10 streams simultaneously
-
-Model Instance 2 (192.168.1.101)
-├── Fetches cameras → only gets 11-20 (1-10 are claimed)
-├── Claims cameras 11-20
-├── Sets model_ip_address = "192.168.1.101"
-└── Processes 10 streams simultaneously
-
-Model Instance 3 (192.168.1.102)
-├── Fetches cameras → only gets 21-30
-├── Claims cameras 21-30
-└── Processes remaining streams
+Admin Dashboard
+├── Registers Model Instance 1 (IP: 41.35.120.50)
+│   └── Assigns cameras 1, 2, 3, 4, 5
+├── Registers Model Instance 2 (IP: 192.168.1.101)
+│   └── Assigns cameras 6, 7, 8, 9, 10
+└── Registers Model Instance 3 (IP: 10.0.0.5)
+    └── Assigns cameras 11, 12, 13, 14, 15
 ```
 
-### Per-Instance Logic
+### What This Means for You
 
-```python
-MAX_CAMERAS = 10
-
-# Fetch only unclaimed cameras
-cameras = get_available_cameras()
-
-# Claim up to MAX_CAMERAS
-for camera in cameras[:MAX_CAMERAS]:
-    success = claim_camera(camera["id"])
-    if success:
-        claimed_cameras.append(camera)
-
-print(f"Claimed {len(claimed_cameras)} cameras")
-```
-
-### API Enforcement
-
-- `GET /cameras` only returns cameras where `model_ip_address IS NULL`
-- `POST /cameras/{id}/claim` rejects if you already have 10 cameras claimed
-- `POST /cameras/{id}/claim` rejects if camera is already claimed by someone else
+- `GET /cameras` returns **only the cameras assigned to your model** — no filtering needed
+- You process ALL cameras returned — no claiming or releasing
+- If the admin adds/removes cameras from your assignment, the next `GET /cameras` call reflects the change
+- You can periodically re-fetch cameras (e.g., every 5 minutes) to pick up assignment changes
 
 ---
 
@@ -683,7 +754,7 @@ class HeartbeatService:
         self.running = False
     
     def update_cameras(self, camera_ids):
-        """Call when cameras change (claim/release)"""
+        """Call when camera assignments change (after re-fetching)"""
         self.camera_ids = camera_ids
     
     def _run(self):
@@ -704,15 +775,16 @@ class HeartbeatService:
 |----------------|----------------|
 | 0-60s | Nothing — normal gap between heartbeats |
 | 60-120s | Backend starts monitoring (warning logged) |
-| > 120s (2 min) | Backend releases ALL cameras claimed by your instance |
-| After release | Cameras become available for other model instances |
+| > 120s (2 min) | Backend marks your model as inactive |
+| After inactive | Admin is notified; cameras remain assigned but not being processed |
 
 ### Recovery
 
 If your service crashes and restarts:
-1. The backend already released your cameras (after 2 min timeout)
-2. Just call `GET /cameras` again — your previously claimed cameras are now available
-3. Claim them again and resume
+1. Login again (`POST /api/model/login`) to get a new token
+2. Fetch your assigned cameras (`GET /api/model/cameras`) — they're still assigned to you
+3. Decrypt credentials and resume processing
+4. Heartbeat resumes — backend marks model as active again
 
 ---
 
@@ -748,8 +820,7 @@ def watch_camera(camera):
         if not ret:
             consecutive_failures += 1
             if consecutive_failures >= MAX_FAILURES:
-                print(f"Camera {camera['id']} unreachable — releasing")
-                release_camera(camera["id"])
+                print(f"Camera {camera['id']} unreachable — skipping")
                 break
             time.sleep(1)
             cap = cv2.VideoCapture(camera["rtsp_url"])  # Reconnect
@@ -765,13 +836,8 @@ def watch_camera(camera):
 import signal
 
 def shutdown_handler(signum, frame):
-    print("Shutting down — releasing all cameras...")
+    print("Shutting down gracefully...")
     heartbeat_service.stop()
-    for camera in claimed_cameras:
-        try:
-            release_camera(camera["id"])
-        except:
-            pass  # Best effort
     sys.exit(0)
 
 signal.signal(signal.SIGTERM, shutdown_handler)
@@ -787,13 +853,15 @@ signal.signal(signal.SIGINT, shutdown_handler)
 ```bash
 # Backend API
 BACKEND_URL=http://192.168.1.50:8000
-MODEL_API_KEY=your_secret_api_key_here
+MODEL_EMAIL=model1@system.local
+MODEL_PASSWORD=your_password_here
+MODEL_ENCRYPTION_KEY=base64:your_aes_256_key_here
 
 # Processing
-MAX_CAMERAS=10
 ALERT_THRESHOLD=50.0          # Confidence % to trigger alert
 CRIME_THRESHOLD=80.0          # Confidence % to confirm crime
 HEARTBEAT_INTERVAL=60         # Seconds between heartbeats
+CAMERA_REFRESH_INTERVAL=300   # Seconds between camera list refreshes
 
 # Camera
 RTSP_TRANSPORT=tcp            # tcp or udp (tcp is more reliable)
@@ -808,11 +876,13 @@ import os
 
 class Config:
     BACKEND_URL = os.getenv("BACKEND_URL", "http://localhost:8000")
-    API_KEY = os.getenv("MODEL_API_KEY", "")
-    MAX_CAMERAS = int(os.getenv("MAX_CAMERAS", 10))
+    MODEL_EMAIL = os.getenv("MODEL_EMAIL", "")
+    MODEL_PASSWORD = os.getenv("MODEL_PASSWORD", "")
+    ENCRYPTION_KEY = os.getenv("MODEL_ENCRYPTION_KEY", "")
     ALERT_THRESHOLD = float(os.getenv("ALERT_THRESHOLD", 50.0))
     CRIME_THRESHOLD = float(os.getenv("CRIME_THRESHOLD", 80.0))
     HEARTBEAT_INTERVAL = int(os.getenv("HEARTBEAT_INTERVAL", 60))
+    CAMERA_REFRESH_INTERVAL = int(os.getenv("CAMERA_REFRESH_INTERVAL", 300))
     FRAME_SKIP = int(os.getenv("FRAME_SKIP", 5))
 ```
 
@@ -820,16 +890,13 @@ class Config:
 
 ## Data Contracts
 
-### Camera Object (from GET /cameras)
+### Camera Object (from GET /cameras — before decryption)
 
 ```json
 {
   "id": 1,
   "name": "Main Entrance",
-  "ip_address": "192.168.1.6",
-  "rtsp_url": "rtsp://user:pass@192.168.1.6:554/stream2",
-  "user_name": "mohamed",
-  "password": "m0ohamed123456789",
+  "encrypted_data": "eyJpdiI6Ik...(base64 AES-256-CBC encrypted)...",
   "lat": 30.0444,
   "lang": 31.2357,
   "storage_type": "none",
@@ -837,18 +904,42 @@ class Config:
 }
 ```
 
+### Camera Object (after decryption of `encrypted_data`)
+
+```json
+{
+  "ip_address": "192.168.1.6",
+  "connection_ip": "41.35.120.50",
+  "connection_port": 8554,
+  "rtsp_url": "rtsp://mohamed:m0ohamed123456789@41.35.120.50:8554/stream2",
+  "user_name": "mohamed",
+  "password": "m0ohamed123456789",
+  "api_port": 8443,
+  "onvif_port": 8080
+}
+```
+
 | Field | Type | Description |
 |-------|------|-------------|
 | `id` | int | Unique camera ID (use in all API calls) |
 | `name` | string | Human-readable camera name |
-| `ip_address` | string | Camera's IP on the local network |
-| `rtsp_url` | string | **Complete RTSP URL** — connect directly with OpenCV |
-| `user_name` | string | Camera login username |
-| `password` | string | Camera login password |
+| `encrypted_data` | string | AES-256-CBC encrypted JSON containing credentials |
 | `lat` | float | Camera latitude (for location context) |
 | `lang` | float | Camera longitude |
 | `storage_type` | string | `"none"`, `"sd_card"`, or `"cloud"` — you don't need to handle this |
 | `police_station_id` | int | Which police station owns this camera |
+
+**Decrypted fields:**
+| Field | Type | Description |
+|-------|------|-------------|
+| `ip_address` | string | Camera's IP on the local network |
+| `connection_ip` | string/null | Public IP for remote access (use this if set) |
+| `connection_port` | int | RTSP port (default 554) |
+| `rtsp_url` | string | **Complete RTSP URL** — connect directly with OpenCV |
+| `user_name` | string | Camera login username |
+| `password` | string | Camera login password |
+| `api_port` | int | Camera API port |
+| `onvif_port` | int | ONVIF port |
 
 ### Alert Request
 
@@ -900,32 +991,31 @@ During development, you can test without real cameras:
 
 3. **Manual testing flow:**
    ```bash
-   # 1. Fetch cameras
-   curl -H "X-Model-Api-Key: test_key" http://localhost:8000/api/model/cameras
+   # 1. Login
+   TOKEN=$(curl -s -X POST -H "Content-Type: application/json" \
+        -d '{"email": "model1@system.local", "password": "test_password"}' \
+        http://localhost:8000/api/model/login | jq -r '.data.token')
    
-   # 2. Claim a camera
-   curl -X POST -H "X-Model-Api-Key: test_key" http://localhost:8000/api/model/cameras/1/claim
+   # 2. Fetch assigned cameras (encrypted)
+   curl -H "Authorization: Bearer $TOKEN" http://localhost:8000/api/model/cameras
    
    # 3. Send heartbeat
-   curl -X POST -H "X-Model-Api-Key: test_key" -H "Content-Type: application/json" \
+   curl -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
         -d '{"camera_ids": [1]}' http://localhost:8000/api/model/heartbeat
    
    # 4. Send alert
-   curl -X POST -H "X-Model-Api-Key: test_key" -H "Content-Type: application/json" \
+   curl -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
         -d '{"camera_id": 1, "confidence_score": 75.0, "alert_type": "suspicious"}' \
         http://localhost:8000/api/model/alert
    
    # 5. Report crime
-   curl -X POST -H "X-Model-Api-Key: test_key" -H "Content-Type: application/json" \
+   curl -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
         -d '{"camera_id": 1, "crime_type": "theft", "confidence_score": 92.5, "start_time": "2026-02-27T14:28:00Z", "end_time": "2026-02-27T14:32:00Z"}' \
         http://localhost:8000/api/model/crime
    
    # 6. Stop alert
-   curl -X POST -H "X-Model-Api-Key: test_key" -H "Content-Type: application/json" \
+   curl -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
         -d '{"camera_id": 1}' http://localhost:8000/api/model/alert/stop
-   
-   # 7. Release camera
-   curl -X DELETE -H "X-Model-Api-Key: test_key" http://localhost:8000/api/model/cameras/1/release
    ```
 
 ### With Real Tapo C200 Cameras
@@ -968,6 +1058,7 @@ while cap.isOpened():
 Python >= 3.10
 OpenCV (opencv-python or opencv-python-headless)
 requests
+cryptography                   # for AES-256-CBC decryption
 pytapo (if using direct alarm)
 your AI model dependencies (torch, tensorflow, etc.)
 ```
@@ -986,7 +1077,9 @@ After=network.target
 User=model
 WorkingDirectory=/opt/crime-model
 Environment=BACKEND_URL=http://192.168.1.50:8000
-Environment=MODEL_API_KEY=your_key
+Environment=MODEL_EMAIL=model1@system.local
+Environment=MODEL_PASSWORD=your_password
+Environment=MODEL_ENCRYPTION_KEY=base64:your_key
 ExecStart=/opt/crime-model/venv/bin/python main.py
 Restart=always
 RestartSec=10
@@ -1011,20 +1104,20 @@ CMD ["python", "main.py"]
 
 ### Multiple Instances
 
-To scale beyond 10 cameras, run multiple instances:
+To handle more cameras, the admin registers multiple model instances from the dashboard and assigns cameras to each:
 
 ```bash
-# Instance 1 — handles cameras 1-10
-MODEL_API_KEY=key1 python main.py
+# Instance 1 — admin assigned cameras 1-5
+MODEL_EMAIL=model1@system.local MODEL_PASSWORD=pass1 python main.py
 
-# Instance 2 — handles cameras 11-20 (automatically gets different cameras)
-MODEL_API_KEY=key2 python main.py
+# Instance 2 — admin assigned cameras 6-10
+MODEL_EMAIL=model2@system.local MODEL_PASSWORD=pass2 python main.py
 
-# Instance 3 — handles cameras 21-30
-MODEL_API_KEY=key3 python main.py
+# Instance 3 — admin assigned cameras 11-15
+MODEL_EMAIL=model3@system.local MODEL_PASSWORD=pass3 python main.py
 ```
 
-Each instance automatically gets different cameras because the `GET /cameras` endpoint only returns unclaimed cameras.
+Each instance has its own credentials and IP whitelist. The admin controls which cameras each instance processes.
 
 ---
 
@@ -1038,49 +1131,83 @@ import time
 import threading
 import requests
 import cv2
+import json
+import base64
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from cryptography.hazmat.primitives import padding as sym_padding
+from cryptography.hazmat.backends import default_backend
 from config import Config
 
 class CrimeDetectionService:
     def __init__(self):
         self.config = Config()
         self.session = requests.Session()
-        self.session.headers["X-Model-Api-Key"] = self.config.API_KEY
-        self.claimed_cameras = []
+        self.cameras = []
         self.running = True
+        self.token = None
     
     def start(self):
-        # 1. Fetch and claim cameras
-        self.fetch_and_claim_cameras()
+        # 1. Login
+        self.login()
         
-        # 2. Start heartbeat
+        # 2. Fetch assigned cameras and decrypt credentials
+        self.fetch_cameras()
+        
+        # 3. Start heartbeat
         self.start_heartbeat()
         
-        # 3. Start processing each camera in own thread
+        # 4. Start processing each camera in own thread
         threads = []
-        for camera in self.claimed_cameras:
+        for camera in self.cameras:
             t = threading.Thread(target=self.process_camera, args=(camera,))
             t.daemon = True
             t.start()
             threads.append(t)
         
-        # 4. Wait for all threads
+        # 5. Wait for all threads
         try:
             while self.running:
                 time.sleep(1)
         except KeyboardInterrupt:
             self.shutdown()
     
-    def fetch_and_claim_cameras(self):
-        resp = self.session.get(f"{self.config.BACKEND_URL}/api/model/cameras")
-        cameras = resp.json()["data"]
+    def login(self):
+        resp = self.session.post(f"{self.config.BACKEND_URL}/api/model/login", json={
+            "email": self.config.MODEL_EMAIL,
+            "password": self.config.MODEL_PASSWORD
+        })
+        resp.raise_for_status()
+        self.token = resp.json()["data"]["token"]
+        self.session.headers["Authorization"] = f"Bearer {self.token}"
+        print(f"✅ Logged in successfully")
+    
+    def decrypt_camera_data(self, encrypted_payload: str) -> dict:
+        payload = json.loads(base64.b64decode(encrypted_payload))
+        iv = base64.b64decode(payload["iv"])
+        value = base64.b64decode(payload["value"])
+        key = base64.b64decode(self.config.ENCRYPTION_KEY.replace("base64:", ""))
         
-        for cam in cameras[:self.config.MAX_CAMERAS]:
-            try:
-                self.session.post(f"{self.config.BACKEND_URL}/api/model/cameras/{cam['id']}/claim")
-                self.claimed_cameras.append(cam)
-                print(f"✅ Claimed camera: {cam['name']} ({cam['ip_address']})")
-            except Exception as e:
-                print(f"❌ Failed to claim {cam['name']}: {e}")
+        cipher = Cipher(algorithms.AES(key), modes.CBC(iv), backend=default_backend())
+        decryptor = cipher.decryptor()
+        decrypted_padded = decryptor.update(value) + decryptor.finalize()
+        
+        unpadder = sym_padding.PKCS7(128).unpadder()
+        decrypted = unpadder.update(decrypted_padded) + unpadder.finalize()
+        return json.loads(decrypted)
+    
+    def fetch_cameras(self):
+        resp = self.session.get(f"{self.config.BACKEND_URL}/api/model/cameras")
+        raw_cameras = resp.json()["data"]
+        
+        self.cameras = []
+        for cam in raw_cameras:
+            decrypted = self.decrypt_camera_data(cam["encrypted_data"])
+            cam_data = {**cam, **decrypted}
+            del cam_data["encrypted_data"]
+            self.cameras.append(cam_data)
+            print(f"✅ Camera ready: {cam['name']} ({decrypted.get('connection_ip') or decrypted['ip_address']})")
+        
+        print(f"📷 Total cameras assigned: {len(self.cameras)}")
     
     def process_camera(self, camera):
         cap = cv2.VideoCapture(camera["rtsp_url"])
@@ -1130,25 +1257,19 @@ class CrimeDetectionService:
         def heartbeat_loop():
             while self.running:
                 try:
-                    ids = [c["id"] for c in self.claimed_cameras]
+                    ids = [c["id"] for c in self.cameras]
                     self.session.post(f"{self.config.BACKEND_URL}/api/model/heartbeat",
                                      json={"camera_ids": ids})
                 except:
                     pass
-                time.sleep(60)
+                time.sleep(self.config.HEARTBEAT_INTERVAL)
         
         t = threading.Thread(target=heartbeat_loop, daemon=True)
         t.start()
     
     def shutdown(self):
-        print("Shutting down...")
+        print("Shutting down gracefully...")
         self.running = False
-        for cam in self.claimed_cameras:
-            try:
-                self.session.delete(f"{self.config.BACKEND_URL}/api/model/cameras/{cam['id']}/release")
-                print(f"Released camera: {cam['name']}")
-            except:
-                pass
 
 if __name__ == "__main__":
     service = CrimeDetectionService()
@@ -1159,9 +1280,10 @@ if __name__ == "__main__":
 
 ## Summary Checklist
 
-- [ ] Set up Python project with dependencies
+- [ ] Set up Python project with dependencies (including `cryptography`)
+- [ ] Implement login flow (POST /api/model/login)
 - [ ] Implement camera fetching from Laravel API
-- [ ] Implement camera claiming/releasing
+- [ ] Implement AES-256-CBC decryption for camera credentials
 - [ ] Connect to RTSP streams via OpenCV
 - [ ] Integrate AI model for crime detection
 - [ ] Implement confidence thresholds (alert vs. crime)
@@ -1170,9 +1292,10 @@ if __name__ == "__main__":
 - [ ] Implement crime reporting (POST /crime)
 - [ ] Implement alert stop (POST /alert/stop)
 - [ ] Implement heartbeat (every 60s)
-- [ ] Handle graceful shutdown (release cameras)
-- [ ] Handle camera disconnections (retry + release)
+- [ ] Handle graceful shutdown
+- [ ] Handle camera disconnections (retry + skip)
+- [ ] Implement periodic camera list refresh (pick up assignment changes)
 - [ ] Test with real Tapo C200 cameras
-- [ ] Test full flow: detect → alarm → alert → crime → stop
+- [ ] Test full flow: login → decrypt → detect → alarm → alert → crime → stop
 - [ ] Optimize: frame skipping, threading, GPU acceleration
 - [ ] Deploy as systemd service or Docker container

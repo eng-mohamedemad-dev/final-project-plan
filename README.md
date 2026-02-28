@@ -5,8 +5,10 @@
 Build a multi-guard crime prediction system where AI models monitor Tapo C200 cameras, detect crimes, and alert nearby officers and police stations. The system has 3 user types (admins, officers, police_stations) each with separate auth, dashboards, and mobile APIs. The existing camera control API (35+ endpoints with Tapo/ONVIF integration) serves as the foundation. We'll add domain models matching the ERD, multi-guard Sanctum authentication, an admin Livewire dashboard, a RESTful API for the Flutter mobile app, Pusher for real-time updates, and Firebase for push notifications.
 
 **Key Assumptions:**
-- The AI model runs as a separate server — it fetches cameras from Laravel, watches streams via RTSP, and calls a Laravel webhook API when it detects a crime. The `model_ip_address` field on cameras is used to "claim" a camera so other model instances don't process it.
-- **Load balancing**: Each model instance handles a maximum of **10 cameras**. When a model claims cameras, it sets its `model_ip_address`. Other model instances calling the API only receive unclaimed cameras. This distributes the processing load across multiple model servers.
+- The AI model is registered by the **admin** from the dashboard. Admin creates a model instance (email, password, IP whitelist) and assigns specific cameras to it via checkboxes (only unassigned cameras are shown). The model then logs in via its own endpoint and receives a Sanctum token.
+- **IP Verification**: Every model API request (including login) is validated against the model's whitelisted `ip_address`. If the request IP doesn't match, it's rejected with 403. This prevents stolen credentials from being used elsewhere.
+- **Camera assignment**: Cameras are assigned to models by the admin (many-to-many via `camera_model` pivot table). The model simply fetches its assigned cameras — no claim/release mechanism needed.
+- **Camera data encryption**: Sensitive camera data (credentials, RTSP URLs) returned to the model API is **encrypted** using AES-256-CBC with a shared secret (`MODEL_ENCRYPTION_KEY` in `.env`). The model decrypts it on its side using the same key. This prevents credential theft if API responses are intercepted.
 - **Camera alarm**: The AI model triggers the camera alarm **directly** (since it already has RTSP access to the camera). This is faster than routing through Laravel. The model calls the camera's alarm API immediately upon detection.
 - **Scene recording — dual strategy**:
   - If camera has storage (SD card or cloud) → `storage_type = 'sd_card'` or `'cloud'` → Laravel fetches the recording from the camera using the existing recording API endpoints.
@@ -25,23 +27,27 @@ Build a multi-guard crime prediction system where AI models monitor Tapo C200 ca
 ## Crime Detection Flow (End-to-End)
 
 ```
-1. AI Model fetches unclaimed cameras from Laravel (GET /api/model/cameras)
-   - Receives max 10 cameras with full RTSP URLs (stream2 / low quality)
-   - Claims them (POST /api/model/cameras/{id}/claim) → sets model_ip_address
+1. Admin registers AI Model instance from dashboard (email, password, IP whitelist)
+   - Admin assigns cameras to the model via checkboxes (only unassigned cameras shown)
+
+2. AI Model logs in (POST /api/model/login) — IP verified against whitelist
+   - Receives Sanctum token
+   - Fetches assigned cameras (GET /api/model/cameras) — encrypted response
+   - Decrypts camera credentials using shared MODEL_ENCRYPTION_KEY
    - Sends heartbeat every 60s (POST /api/model/heartbeat)
 
-2. Model watches camera RTSP stream, detects suspicious activity (confidence rises)
+3. Model watches camera RTSP streams, detects suspicious activity (confidence rises)
 
-3. Model triggers camera alarm DIRECTLY (faster than routing through Laravel)
-   - Model has camera credentials from step 1
+4. Model triggers camera alarm DIRECTLY (faster than routing through Laravel)
+   - Model has camera credentials from step 2
    - Uses camera alarm API directly: POST http://{camera_ip}/alarm/start
 
-4. Model sends POST /api/model/alert → Laravel:
+5. Model sends POST /api/model/alert → Laravel:
    - camera_id, confidence_score, alert_type (green→yellow→red)
    - Laravel sends preliminary "⚠️ Suspicious activity" notification to police station
    - Laravel logs alert in activity_logs
 
-5. Model confirms crime POST /api/model/crime → Laravel:
+6. Model confirms crime POST /api/model/crime → Laravel:
    - camera_id, start_time, end_time, crime_type, confidence_score
    - Laravel checks camera storage_type:
      a. If 'sd_card' or 'cloud' → fetches recording from camera using existing API
@@ -55,24 +61,24 @@ Build a multi-guard crime prediction system where AI models monitor Tapo C200 ca
    - Sends Firebase push notification to officer + police station
    - Broadcasts Pusher event to police station + admin dashboard
 
-6. Officer receives notification in Flutter app:
+7. Officer receives notification in Flutter app:
    - Sees crime details, location on map, evidence video
    - Accepts → status: in_progress
    - Arrives → status: visited, officer_arrive_time recorded
    - OR declines → status: not_visited, no_visit_reason required
 
-7. If officer doesn't respond within X minutes → ESCALATION:
+8. If officer doesn't respond within X minutes → ESCALATION:
    - Auto-assign to next nearest officer
    - Notify police station of escalation
    - status: escalated
 
-8. Police station sees real-time updates on dashboard map
+9. Police station sees real-time updates on dashboard map
 
-9. After resolution → status: resolved
+10. After resolution → status: resolved
 
-10. If false alarm → status: false_alarm (feeds back to improve model)
+11. If false alarm → status: false_alarm (feeds back to improve model)
 
-11. Model sends POST /api/model/alert/stop when threat cleared
+12. Model sends POST /api/model/alert/stop when threat cleared
     - Model stops camera alarm directly
 ```
 
@@ -80,13 +86,17 @@ Build a multi-guard crime prediction system where AI models monitor Tapo C200 ca
 
 ## Phase 1: Database Schema & Models
 
-1. Create the `admins` migration and model at `app/Models/Admin.php` with fields: `id`, `name`, `email`, `phone`, `password`, timestamps. Use `Authenticatable` base class. Add `HasFactory`, `Notifiable`, `HasApiTokens` traits.
+1. Create the `admins` migration and model at `app/Models/Admin.php` with fields: `id`, `name`, `email`, `phone`, `password`, `avatar` (nullable — profile photo path), timestamps. Use `Authenticatable` base class. Add `HasFactory`, `Notifiable`, `HasApiTokens` traits.
 
-2. Create the `police_stations` migration and model at `app/Models/PoliceStation.php` with fields: `id`, `name`, `email`, `phone`, `password`, timestamps. Use `Authenticatable`. Relationships: `hasMany(Officer)`, `hasMany(Camera)`, `hasMany(Crime)` (through cameras), `morphMany(FirebaseToken)`, `morphMany(Notification)`.
+2. Create the `police_stations` migration and model at `app/Models/PoliceStation.php` with fields: `id`, `name`, `email`, `phone`, `password`, `avatar` (nullable — station logo/photo), `address` (nullable), `city` (nullable), `governorate` (nullable), timestamps. Use `Authenticatable`. Relationships: `hasMany(Officer)`, `hasMany(Camera)`, `hasMany(Crime)` (through cameras), `morphMany(FirebaseToken)`, `morphMany(Notification)`.
 
-3. Create the `officers` migration and model at `app/Models/Officer.php` with fields: `id`, `police_station_id` (FK), `name`, `email`, `phone`, `password`, `latitude` (decimal 10,7), `longitude` (decimal 10,7), `last_location_update` (timestamp, nullable), `status` (enum: `available`, `busy`, `offline`, default `offline`), `is_on_shift` (boolean, default false), timestamps. Use `Authenticatable`. Relationships: `belongsTo(PoliceStation)`, `hasMany(Crime)`, `morphMany(FirebaseToken)`, `morphMany(Notification)`.
+3. Create the `officers` migration and model at `app/Models/Officer.php` with fields: `id`, `police_station_id` (FK), `name`, `email`, `phone`, `password`, `avatar` (nullable — officer photo), `national_id` (nullable, unique — الرقم القومي), `rank` (nullable — e.g. ملازم, نقيب, رائد), `badge_number` (nullable, unique), `latitude` (decimal 10,7), `longitude` (decimal 10,7), `last_location_update` (timestamp, nullable), `status` (enum: `available`, `busy`, `offline`, default `offline`), `is_on_shift` (boolean, default false), timestamps. Use `Authenticatable`. Relationships: `belongsTo(PoliceStation)`, `hasMany(Crime)`, `morphMany(FirebaseToken)`, `morphMany(Notification)`.
 
-4. Create the `cameras` migration and model at `app/Models/Camera.php` with all ERD fields: `id`, `name`, `police_station_id` (FK), `ip_address`, `user_name`, `password`, `tapo_email`, `tapo_password`, `stream_path` (JSON for stream1/stream2), `location_name`, `lat` (decimal 10,7), `lang` (decimal 10,7), `model_ip_address` (nullable), `is_active` (boolean, default false), `storage_type` (enum: `sd_card`, `cloud`, `none`, default `none` — determines recording strategy), `connection_ip` (nullable — public/VPN IP for remote cameras; if null, falls back to `ip_address`), `connection_port` (integer, default 554 — RTSP port, can be a forwarded port for remote cameras), `api_port` (integer, default 443 — Tapo HTTPS API port, can be forwarded), `onvif_port` (integer, default 2020 — ONVIF port, can be forwarded), timestamps. Relationships: `belongsTo(PoliceStation)`, `hasMany(Crime)`. Add unique constraint on `ip_address`. Add accessor `rtsp_url` that builds the full RTSP URL using `connection_ip` (or `ip_address` as fallback) and `connection_port`: `rtsp://{user_name}:{password}@{effective_ip}:{connection_port}/stream2`. Add accessor `effective_ip` that returns `connection_ip ?? ip_address`. Add accessor `effective_api_url` that returns `https://{effective_ip}:{api_port}`.
+4. Create the `cameras` migration and model at `app/Models/Camera.php` with all ERD fields: `id`, `name`, `police_station_id` (FK), `ip_address`, `user_name`, `password`, `tapo_email`, `tapo_password`, `stream_path` (JSON for stream1/stream2), `location_name`, `lat` (decimal 10,7), `lang` (decimal 10,7), `is_active` (boolean, default false), `storage_type` (enum: `sd_card`, `cloud`, `none`, default `none` — determines recording strategy), `connection_ip` (nullable — public/VPN IP for remote cameras; if null, falls back to `ip_address`), `connection_port` (integer, default 554 — RTSP port, can be a forwarded port for remote cameras), `api_port` (integer, default 443 — Tapo HTTPS API port, can be forwarded), `onvif_port` (integer, default 2020 — ONVIF port, can be forwarded), timestamps. Relationships: `belongsTo(PoliceStation)`, `hasMany(Crime)`, `belongsToMany(AiModel)`. Add unique constraint on `ip_address`. Add accessor `rtsp_url` that builds the full RTSP URL using `connection_ip` (or `ip_address` as fallback) and `connection_port`: `rtsp://{user_name}:{password}@{effective_ip}:{connection_port}/stream2`. Add accessor `effective_ip` that returns `connection_ip ?? ip_address`. Add accessor `effective_api_url` that returns `https://{effective_ip}:{api_port}`.
+
+4b. Create the `ai_models` migration and model at `app/Models/AiModel.php` with fields: `id`, `name` (descriptive label), `email` (unique — for login), `password`, `ip_address` (whitelisted IP — used to verify every request), `is_active` (boolean, default true), `last_heartbeat_at` (timestamp, nullable), timestamps. Use `Authenticatable` base class. Add `HasFactory`, `HasApiTokens` traits. Relationships: `belongsToMany(Camera)`.
+
+4c. Create the `camera_ai_model` pivot migration (pivot table): `camera_id` (FK), `ai_model_id` (FK), timestamps. Composite unique constraint on `[camera_id, ai_model_id]`.
 
 5. Create the `crime_types` migration and model at `app/Models/CrimeType.php` with fields: `id`, `name_en`, `name_ar`, `description`, `default_severity` (enum: low/medium/high/critical), timestamps. Seed with common crime types (theft, assault, vandalism, break-in, suspicious_activity, etc.).
 
@@ -259,6 +269,9 @@ app/Livewire/Admin/Dashboard.php
 app/Livewire/Admin/PoliceStations/Index.php
 app/Livewire/Admin/PoliceStations/Create.php
 app/Livewire/Admin/PoliceStations/Edit.php
+app/Livewire/Admin/AiModels/Index.php
+app/Livewire/Admin/AiModels/Create.php
+app/Livewire/Admin/AiModels/Edit.php
 app/Livewire/Admin/Settings/Index.php
 app/Livewire/Admin/Profile.php
 app/Livewire/Admin/Notifications.php
@@ -271,6 +284,9 @@ resources/views/livewire/admin/dashboard.blade.php
 resources/views/livewire/admin/police-stations/index.blade.php
 resources/views/livewire/admin/police-stations/create.blade.php
 resources/views/livewire/admin/police-stations/edit.blade.php
+resources/views/livewire/admin/ai-models/index.blade.php
+resources/views/livewire/admin/ai-models/create.blade.php
+resources/views/livewire/admin/ai-models/edit.blade.php
 resources/views/livewire/admin/settings/index.blade.php
 resources/views/livewire/admin/profile.blade.php
 resources/views/livewire/admin/notifications.blade.php
@@ -408,10 +424,11 @@ app/
 │   │   ├── Chat/
 │   │   ├── Import/
 │   │   ├── Model/
+│   │   ├── AiModel/
 │   │   └── Settings/
 │   ├── Resources/                       ← all API response formatting
 │   └── Middleware/
-│       ├── ModelApiKeyMiddleware.php
+│       ├── VerifyModelIpMiddleware.php   ← verifies model request IP against whitelist
 │       └── ResolveGuardMiddleware.php   ← resolves {guard} from URL to auth guard
 ├── Services/                            ← all business logic
 │   ├── Auth/
@@ -426,7 +443,8 @@ app/
 │   ├── Location/
 │   ├── Report/
 │   ├── Settings/
-│   └── Chat/
+│   ├── Chat/
+│   └── Encryption/
 ├── Observers/                           ← automatic model event side effects
 │   ├── CrimeObserver.php
 │   ├── OfficerObserver.php
@@ -437,6 +455,11 @@ app/
 ├── Models/                              ← Eloquent models
 ├── Livewire/                            ← Livewire component PHP classes
 │   └── Admin/
+│       ├── Dashboard, Profile, Notifications, Auth/Login
+│       ├── PoliceStations/{Index,Create,Edit}
+│       ├── AiModels/{Index,Create,Edit}
+│       ├── Settings/Index
+│       └── Chat/{Index,Conversation}
 ├── Traits/                              ← shared traits (ApiResponse, etc.)
 ├── Enums/                               ← PHP enums
 │   ├── CrimeStatus.php
@@ -473,9 +496,9 @@ Cast them in models via `casts()` method.
 
 ## Phase 3: Multi-Guard Authentication
 
-13. Configure 3 authentication guards in `config/auth.php`: `admin`, `police_station`, `officer` — each with its own Eloquent provider pointing to the respective model.
+13. Configure **4** authentication guards in `config/auth.php`: `admin`, `police_station`, `officer`, `ai_model` — each with its own Eloquent provider pointing to the respective model.
 
-14. Configure Sanctum to support all 3 guards for API token authentication. Each guard uses Sanctum's `HasApiTokens` trait on the model.
+14. Configure Sanctum to support all 4 guards for API token authentication. Each guard uses Sanctum's `HasApiTokens` trait on the model.
 
 15. Create **shared** `AuthController` (single controller, dynamic guard via URL segment `/{guard}`):
     - `POST /api/v1/{guard}/login` — resolves guard from URL, authenticates, returns Sanctum token
@@ -487,9 +510,15 @@ Cast them in models via `casts()` method.
     - `police-station` → `police_station` guard + `PoliceStation` model
     - `officer` → `officer` guard + `Officer` model
 
-17. For the web admin dashboard, use session-based auth with the `admin` guard. Create Livewire login component at the admin route.
+16b. Create `VerifyModelIpMiddleware` — verifies that the request IP matches the authenticated model's whitelisted `ip_address` field. Applied to all model routes. Returns 403 if mismatch.
 
-18. Register middleware in `bootstrap/app.php` for guard-based route protection.
+17. Create **Model login endpoint** separately:
+    - `POST /api/model/login` — validates email + password + IP verification (request IP must match whitelisted `ip_address` in `ai_models` table). Returns Sanctum token.
+    - All model endpoints require `auth:sanctum` + `VerifyModelIpMiddleware`.
+
+18. For the web admin dashboard, use session-based auth with the `admin` guard. Create Livewire login component at the admin route.
+
+19. Register middleware in `bootstrap/app.php` for guard-based route protection.
 
 ---
 
@@ -512,6 +541,15 @@ Cast them in models via `casts()` method.
     - **Excel upload**: bulk import police stations from Excel file (use `maatwebsite/excel` or `openspout/openspout` package)
     - Delete with confirmation
     - Show detail page with related officers and cameras
+    - **Reset password** action — admin can change a police station's password
+
+18b. **AI Models CRUD** — Livewire component at `/admin/ai-models`:
+    - List all model instances with status (active/inactive, last heartbeat)
+    - Create: name, email, password, IP address
+    - Edit: update name, email, IP, toggle active/inactive
+    - **Reset password** action — admin can change a model's password
+    - **Camera assignment**: checkboxes to assign cameras to model. Only cameras NOT assigned to another model are shown.
+    - Show assigned cameras with option to remove/reassign
 
 19. **System Settings** — Livewire component at `/admin/settings`:
     - Firebase notification keys configuration (store in DB settings table or `.env`)
@@ -521,7 +559,7 @@ Cast them in models via `casts()` method.
 
 20. **Admin Profile** — Livewire component at `/admin/profile`:
     - Edit name, email, phone, password
-    - Profile photo upload (optional)
+    - Profile photo upload (avatar)
 
 21. **Notifications Page** — Livewire component at `/admin/notifications`:
     - List all notifications with read/unread status
@@ -539,8 +577,9 @@ Cast them in models via `casts()` method.
     - `ChatController` → Chat with officers: `GET /chat/conversations`, `GET /chat/{officer}`, `POST /chat/{officer}`
     - **Officer Tracking**: `GET /officers/locations` (real-time officer positions for map display)
     - **Shared routes** (profile, notifications, dashboard, firebase-token) handled by shared controllers under `/{guard}` prefix
+    - **Password Reset**: `PUT /officers/{id}/reset-password` — police station can change an officer's password
 
-23. Create Eloquent API Resources for: `OfficerResource`, `CameraResource`, `CrimeResource`, `SceneResource`, `NotificationResource`, `PoliceStationResource`, `DashboardResource`, `ChatMessageResource`, `ChatConversationResource`.
+23. Create Eloquent API Resources for: `AiModelResource`, `OfficerResource`, `CameraResource`, `CrimeResource`, `SceneResource`, `NotificationResource`, `PoliceStationResource`, `DashboardResource`, `ChatMessageResource`, `ChatConversationResource`.
 
 24. Create Form Request classes in dedicated subdirectories: `Officer/StoreOfficerRequest`, `Camera/StoreCameraRequest`, `Import/ImportExcelRequest`, `Chat/SendMessageRequest`, etc.
 
@@ -560,17 +599,15 @@ Cast them in models via `casts()` method.
 ## Phase 6: AI Model Integration API
 
 26. Create `AiModelController` with endpoints for the AI model to interact with Laravel:
-    - `GET /api/model/cameras` — list cameras with `is_active = true` and `model_ip_address IS NULL` (unclaimed cameras), **max 10 per request** (enforced by API). Returns:
+    - `POST /api/model/login` — authenticate model with email + password. Also verifies request IP matches the whitelisted `ip_address` in the `ai_models` table. Returns Sanctum token.
+    - `GET /api/model/cameras` — returns **only cameras assigned to the authenticated model** (via `camera_ai_model` pivot table) with `is_active = true`. **Camera credentials are encrypted** using AES-256-CBC with `MODEL_ENCRYPTION_KEY` (shared between Laravel and model). Returns:
       ```json
       {
         "cameras": [
           {
             "id": 1,
             "name": "Main Entrance",
-            "ip_address": "192.168.1.6",
-            "rtsp_url": "rtsp://mohamed:m0ohamed123456789@192.168.1.6:554/stream2",
-            "user_name": "mohamed",
-            "password": "m0ohamed123456789",
+            "encrypted_data": "BASE64_AES_ENCRYPTED_STRING",
             "lat": 30.0444,
             "lang": 31.2357,
             "storage_type": "none",
@@ -579,9 +616,20 @@ Cast them in models via `casts()` method.
         ]
       }
       ```
-    - `POST /api/model/cameras/{id}/claim` — model sets its IP in `model_ip_address` to claim a camera. **Rejects if model already has 10 cameras claimed.**
-    - `DELETE /api/model/cameras/{id}/release` — model releases a camera
-    - `POST /api/model/heartbeat` — model sends periodic heartbeat (every 60s) with list of camera IDs it's monitoring. If heartbeat missed for 2+ minutes, Laravel releases claimed cameras (via scheduled task) so other model instances can pick them up.
+      The `encrypted_data` field, when decrypted, contains:
+      ```json
+      {
+        "ip_address": "192.168.1.6",
+        "connection_ip": "41.35.100.50",
+        "connection_port": 8554,
+        "rtsp_url": "rtsp://mohamed:m0ohamed123456789@41.35.100.50:8554/stream2",
+        "user_name": "mohamed",
+        "password": "m0ohamed123456789",
+        "api_port": 8443,
+        "onvif_port": 8080
+      }
+      ```
+    - `POST /api/model/heartbeat` — model sends periodic heartbeat (every 60s) with list of camera IDs it's monitoring. If heartbeat missed for 2+ minutes, model marked inactive (via scheduled task).
     - `POST /api/model/alert` — model sends initial alert (confidence rising, suspicious activity). Payload: `{camera_id, confidence_score, alert_type: "suspicious"}`. **Note: Model triggers camera alarm DIRECTLY** (not through Laravel — faster response time). Laravel:
       1. Sends preliminary notification to police station ("⚠️ Suspicious activity detected at Camera X")
       2. Broadcasts Pusher event to police station + admin dashboard
@@ -606,9 +654,15 @@ Cast them in models via `casts()` method.
       11. Logs everything in `activity_logs`
     - `POST /api/model/alert/stop` — model reports scene ended (confidence back to green). **Model stops camera alarm directly.** Laravel logs the event.
 
-27. Secure model endpoints with a shared API key (stored in `.env` as `MODEL_API_KEY`) via `ModelApiKeyMiddleware`, since the model isn't a "user" — just an authenticated service.
+27. Secure model endpoints with Sanctum token authentication (`auth:sanctum` guard `ai_model`) + `VerifyModelIpMiddleware` on every request. The login endpoint itself also verifies IP before issuing a token.
 
-28. Create a **scheduled task** (every 2 minutes) to check model heartbeats — release cameras from models that haven't sent heartbeat, mark them as available for other instances.
+28. Create `EncryptionService` at `app/Services/Encryption/EncryptionService.php`:
+    - Uses AES-256-CBC with `MODEL_ENCRYPTION_KEY` from `.env`
+    - Methods: `encrypt(array $data): string`, `decrypt(string $encrypted): array`
+    - Used by `ModelCameraResource` to encrypt camera credentials before API response
+    - The AI model service uses the same key to decrypt on its side
+
+29. Create a **scheduled task** (every 2 minutes) to check model heartbeats — mark models as inactive (`is_active = false`) if heartbeat missed, log the event.
 
 ---
 
@@ -749,7 +803,7 @@ Cast them in models via `casts()` method.
     - `recording_segment_duration_seconds` (default 60 — ffmpeg segment length for cameras with no storage)
     - `recording_retention_days` (default 7 — how long to keep ffmpeg segments)
     - `crime_evidence_retention_days` (default 90 — how long to keep crime evidence files)
-    - `max_cameras_per_model` (default 10 — load balancing limit)
+    - `model_encryption_key` — AES-256-CBC key shared between Laravel and AI model (also in `.env` as `MODEL_ENCRYPTION_KEY`)
 
 44. Create `Setting` model and `SettingsService` for easy access: `Setting::get('key', 'default')`, `Setting::set('key', 'value')`. Cache settings in Redis for performance.
 
@@ -768,12 +822,16 @@ Cast them in models via `casts()` method.
     - API resource response structure
     - Notification sending (mock Firebase)
     - Camera health check
-    - Model API key authentication
+    - Model Sanctum authentication + IP verification
+    - Camera data encryption/decryption (AES-256-CBC)
+    - Admin model CRUD + camera assignment
+    - Admin → police station password reset
+    - Police station → officer password reset
+    - Admin → model password reset
     - Settings CRUD
     - Report generation
     - Scene extraction (both storage types)
     - Camera recording service management
-    - Model load balancing (10 camera limit)
 
 ---
 
@@ -866,12 +924,15 @@ Cast them in models via `casts()` method.
 - **Geolocation**: PostgreSQL Haversine formula (no PostGIS needed for basic radius queries)
 - **API Versioning**: `/api/v1/` prefix for all mobile API routes for future compatibility
 - **Crime Assignment**: Automatic — system finds nearest officer and assigns. Officer can decline with reason. Auto-escalation after timeout.
-- **Model Auth**: Simple API key middleware (not Sanctum) since the AI model is a service, not a user
+- **Model Auth**: Sanctum token + IP whitelist verification. Model logs in with email/password (like other guards), gets a Sanctum token. Every request also verified against whitelisted IP via `VerifyModelIpMiddleware`. Login itself checks IP before issuing token.
+- **Model Management**: Admin registers AI model instances from the dashboard (name, email, password, IP). Admin assigns cameras to models via checkboxes (many-to-many pivot). Only cameras NOT assigned to another model are shown. No self-service claiming.
+- **Camera Data Encryption**: Sensitive camera data (credentials, RTSP URLs, IPs) encrypted with AES-256-CBC using `MODEL_ENCRYPTION_KEY` before sending to model API. Model decrypts using the same shared key. Prevents data interception.
+- **Password Management**: Hierarchical password resets — admin can reset police station and model passwords; police station can reset officer passwords. No self-service password reset (no email flow).
 - **Scene Recording**: Dual strategy — camera with storage uses its own API, camera without storage uses server-side ffmpeg recording (1-min segments, merged on demand)
-- **Camera Alarm**: Triggered **directly by the AI model** (not through Laravel) for fastest response time. Model already has camera credentials from the claim API.
-- **RTSP URL**: Full URL returned in camera API response for direct model connection. Format: `rtsp://{user}:{pass}@{effective_ip}:{connection_port}/stream2`. Uses `connection_ip` (public/VPN IP) if set, otherwise falls back to `ip_address` (local LAN).
+- **Camera Alarm**: Triggered **directly by the AI model** (not through Laravel) for fastest response time. Model already has camera credentials from the assigned cameras API (decrypted locally).
+- **RTSP URL**: Full URL returned (encrypted) in camera API response for direct model connection. Format: `rtsp://{user}:{pass}@{effective_ip}:{connection_port}/stream2`. Uses `connection_ip` (public/VPN IP) if set, otherwise falls back to `ip_address` (local LAN).
 - **Camera Networking**: Cameras on remote networks (different WiFi) require port forwarding. The camera model stores `connection_ip`, `connection_port`, `api_port`, `onvif_port` — these can differ from local LAN values. For same-network cameras, these fields are either null (use defaults) or match local values. For remote cameras, `connection_ip` = router public IP, ports = forwarded ports. This keeps the system flexible for both dev (same LAN) and production (remote) without code changes.
-- **Model Load Balancing**: Each model instance handles max 10 cameras, enforced by API. Load distributed automatically via claim mechanism.
+- **Model Load Balancing**: Admin-controlled — admin assigns cameras to each model instance from the dashboard. No auto-claiming or per-model limits; admin decides the distribution.
 - **Enums**: PHP 8.4 backed enums for all status/type fields — type-safe, auto-cast in models
 - **Caching**: Redis for settings, session, queue, and cache. All configurable values cached.
 - **Queue Driver**: Redis — for notifications, escalation checks, camera health checks, report generation, scene extraction, chat notifications
@@ -918,7 +979,7 @@ Cast them in models via `casts()` method.
 ```
 app/
 ├── Models/              Admin, PoliceStation, Officer, Camera, Crime, Scene,
-│                        CrimeType, FirebaseToken, Setting, ActivityLog, ChatMessage
+│                        CrimeType, FirebaseToken, Setting, ActivityLog, ChatMessage, AiModel
 │
 ├── Enums/               CrimeStatus, CrimeSeverity, OfficerStatus, StorageType, DeviceType, MessageType
 │
@@ -927,16 +988,17 @@ app/
 │   │   └── Api/V1/
 │   │       ├── Shared/          AuthController, ProfileController, NotificationController,
 │   │       │                    FirebaseTokenController, DashboardController, StatisticsController
-│   │       ├── Admin/           PoliceStationController, SettingsController, ChatController
+│   │       ├── Admin/           PoliceStationController, AiModelController, SettingsController, ChatController
 │   │       ├── PoliceStation/   OfficerController, CameraController, CrimeController, ChatController
 │   │       ├── Officer/         CrimeController, LocationController, StatusController, ChatController
 │   │       └── Model/           AiModelController
 │   ├── Requests/                Organized by domain: Auth/, Officer/, Camera/, Crime/, Chat/,
-│   │                            Import/, Model/, Settings/, PoliceStation/
+│   │                            Import/, Model/, Settings/, PoliceStation/, AiModel/
 │   ├── Resources/               AdminResource, OfficerResource, CameraResource, CrimeResource,
 │   │                            SceneResource, NotificationResource, ChatMessageResource,
-│   │                            ChatConversationResource, DashboardResource, ModelCameraResource
-│   └── Middleware/              ModelApiKeyMiddleware, ResolveGuardMiddleware
+│   │                            ChatConversationResource, DashboardResource, ModelCameraResource,
+│                            AiModelResource
+│   └── Middleware/              VerifyModelIpMiddleware, ResolveGuardMiddleware
 │
 ├── Services/                    Organized by domain:
 │   ├── Auth/                    AuthService
@@ -951,7 +1013,8 @@ app/
 │   ├── Location/                NearestOfficerService
 │   ├── Report/                  ReportService
 │   ├── Settings/                SettingsService
-│   └── Chat/                    ChatService
+│   ├── Chat/                    ChatService
+│   └── Encryption/              EncryptionService
 │
 ├── Observers/                   CrimeObserver, OfficerObserver, CameraObserver, PoliceStationObserver
 │
@@ -963,8 +1026,8 @@ app/
 │                                SendChatNotification
 │
 ├── Livewire/Admin/              Auth/Login, Dashboard, PoliceStations/{Index,Create,Edit},
-│                                Settings/Index, Profile, Notifications,
-│                                Chat/{Index,Conversation}
+│                                AiModels/{Index,Create,Edit}, Settings/Index, Profile,
+│                                Notifications, Chat/{Index,Conversation}
 │
 ├── Console/Commands/            CheckModelHeartbeats, EscalateStaleCrimes, CheckCameraHealth,
 │                                ManageCameraRecording, CleanupRecordings
@@ -976,6 +1039,7 @@ app/
 resources/views/
 ├── layouts/                     admin.blade.php
 ├── livewire/admin/              dashboard, police-stations/{index,create,edit},
+│                                ai-models/{index,create,edit},
 │                                settings/index, profile, notifications, auth/login,
 │                                chat/{index,conversation}
 └── components/                  Shared Blade components (tables, modals, charts, etc.)
@@ -1090,6 +1154,7 @@ Route::prefix('model')->group(fn () => require __DIR__.'/api/v1/model.php');
 | GET | `/api/v1/police-station/chat/conversations` | List chat conversations |
 | GET | `/api/v1/police-station/chat/{officer}` | Messages with officer |
 | POST | `/api/v1/police-station/chat/{officer}` | Send message to officer |
+| PUT | `/api/v1/police-station/officers/{id}/reset-password` | Reset officer password |
 
 ### Officer App (guard-specific)
 | Method | Endpoint | Description |
@@ -1111,6 +1176,12 @@ Route::prefix('model')->group(fn () => require __DIR__.'/api/v1/model.php');
 | GET/POST | `/api/v1/admin/police-stations` | List / Create station |
 | PUT/DELETE | `/api/v1/admin/police-stations/{id}` | Update / Delete station |
 | POST | `/api/v1/admin/police-stations/import` | Excel import stations |
+| PUT | `/api/v1/admin/police-stations/{id}/reset-password` | Reset station password |
+| GET/POST | `/api/v1/admin/ai-models` | List / Create AI model |
+| PUT/DELETE | `/api/v1/admin/ai-models/{id}` | Update / Delete model |
+| PUT | `/api/v1/admin/ai-models/{id}/reset-password` | Reset model password |
+| POST | `/api/v1/admin/ai-models/{id}/cameras` | Assign cameras to model |
+| DELETE | `/api/v1/admin/ai-models/{id}/cameras/{cameraId}` | Remove camera from model |
 | GET/PUT | `/api/v1/admin/settings` | System settings |
 | GET | `/api/v1/admin/chat/conversations` | List chat conversations |
 | GET | `/api/v1/admin/chat/{policeStation}` | Messages with station |
@@ -1119,9 +1190,8 @@ Route::prefix('model')->group(fn () => require __DIR__.'/api/v1/model.php');
 ### AI Model
 | Method | Endpoint | Description |
 |---|---|---|
-| GET | `/api/model/cameras` | List unclaimed active cameras (max 10) |
-| POST | `/api/model/cameras/{id}/claim` | Claim camera for processing |
-| DELETE | `/api/model/cameras/{id}/release` | Release camera |
+| POST | `/api/model/login` | Login (email + password + IP verification) |
+| GET | `/api/model/cameras` | List assigned cameras (encrypted credentials) |
 | POST | `/api/model/heartbeat` | Model heartbeat |
 | POST | `/api/model/alert` | Suspicious activity alert |
 | POST | `/api/model/alert/stop` | Alert ended |
